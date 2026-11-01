@@ -44,14 +44,6 @@ and subtitles: **[`sample/imagine_2035_final_v27+brand-vo-v04en-e3.mp4`](sample/
 ≈1.6 Mbps is the burn recipe's `-b:v 1600k` showing up exactly, see
 [Combination](#5-combination--the-film-build-ladder).)*
 
-> **Why a GIF instead of the film itself?** GitHub will not play a video that is committed
-> to a repository: `<video>` is stripped from markdown, and a committed `.mp4` only plays
-> one click away on its own file page. A GIF is the only thing that animates inline from a
-> plain `git push`, so the loop leads and the audio stays one click away. If you want the
-> **full cut with sound inline**, drag `sample/imagine_2035_final_v27+brand-vo-v04en-e3.mp4`
-> into the README editor on github.com once and replace the GIF line above with the
-> `user-attachments` URL it returns — nothing else needs to change.
-
 ### Licence
 
 **The code and documents here are MIT** — see [LICENSE](LICENSE).
