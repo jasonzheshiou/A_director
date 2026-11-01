@@ -87,9 +87,124 @@ least a video model, a speech synthesiser and a music model.
 
 ---
 
+# How to direct a film — in plain words
+
+No commands in this section, and no jargon. This is the order to think in;
+[Part I](#part-i--directing-with-it) has the exact commands for each step.
+
+**You are the director. The models are a very fast, very literal crew.** They do exactly
+what you ask, immediately, and they have no idea whether the result is any good. Every
+step below is cheap except one, so the whole method is: **spend your cheap steps until the
+shot is obviously right, then pay for the expensive one once.**
+
+### 1. Ask a language model for the story — then cut it in half
+
+Ask for a logline and a beat sheet for a **60–120 second** film with one turn at the end,
+and ask it to say the turn in a single sentence. If you cannot say it in one sentence, the
+film is not one film yet.
+
+Then delete about half the beats. Words are free and video is not: have the argument with
+the language model, never with the render queue.
+
+> **Good use of the same model later:** paste your finished shot list back in and ask
+> *"which of these shots are redundant, and what would I cut to make this 90 seconds?"*
+> It is a much better editor than it is a better writer.
+
+### 2. Turn it into a numbered shot list
+
+Ask for **10–15 shots, one line each**: who is in frame, where, what moves, how long it
+should feel. Keep that list as a plain text file — it is the one document every later step
+reads, and the thing you will be grateful for when you are on shot eleven at midnight.
+
+Write one short paragraph describing your character (clothes, hair, glasses, build) and
+paste it into every shot that does **not** continue from the previous one. Shots that do
+continue inherit the previous shot's last frame instead, which is what actually keeps the
+character looking like the same person.
+
+### 3. Draw it before you film it
+
+Generate stills of your main character and your two or three key scenes — four to six of
+each, and pick. A still costs **tens of seconds**. A bad shot costs **ten minutes**. This
+is the cheapest step on the whole list and the one people skip.
+
+### 4. Record the voice before you cut the picture
+
+Generate the narration first, **two or three reads of every line**, and pick the ones you
+would actually want to hear. Once the takes exist, their lengths are real, and the picture
+gets cut *to them*.
+
+Re-record after you cut and you re-time every subtitle and every music cue you place
+afterwards. This single order saves more hours than anything else here.
+
+### 5. Render short takes, and make more than one of each
+
+This is the expensive step, so budget it like money:
+
+| a take of | costs about | use it for |
+|---|---|---|
+| 5 seconds | **~10 minutes** | trying things out |
+| 10 seconds | **~36 minutes** | only a shot you would defend |
+
+So for one shot: make **three 5-second variations** (~30 min), keep the best, and *then*
+maybe make the 10-second version. Never render a long take of a shot you have not seen at
+five seconds.
+
+Three tips that save real time here:
+
+* **Batch, don't drip.** The machine has to swap models before the first job and after the
+  last one. Six shots in one batch pay that swap once; six separate requests pay it six
+  times.
+* **Same words, different seed.** If a face or a hand is broken, re-render the same
+  description with a different seed before you rewrite anything. A rewrite usually fixes
+  one thing and breaks two.
+* **Keep the rejects.** Not out of sentiment — after twenty rejects you can see what the
+  model *systematically* gets wrong, and that is exactly what your next shot list should
+  avoid asking for.
+
+### 6. Make the music last, and keep it boring
+
+Generate **five to ten short cues** with different seeds or styles and pick one. Each costs
+minutes, and picking beats designing. One cue, looped and faded, is nearly always the right
+answer for a short film; the level should live behind a single number so turning it down
+later is a one-character edit.
+
+### 7. Subtitles come from the finished audio
+
+Never from the script, and never hand-timed: measure where the speech actually starts and
+stops in the rendered audio, and build the cues from that. Hand-timing drifts the moment
+anyone re-records a line.
+
+### 8. Combine in the cheap order
+
+Assemble first without touching the picture at all, watch it **start to finish**, fix the
+audio until it is right — and only then burn in subtitles or overlays, once, because that
+step re-encodes the entire film. Burn early and you will do it again for every tweak.
+
+### 9. Watch it twice before you believe it
+
+Full screen once, then **on a phone**. The phone pass finds every subtitle that is too
+small, every line of narration that is too quiet, and every cut that only made sense at
+your desk. And don't trust a "success" message on a burn — pull out a couple of frames and
+look at them.
+
+### Naming, versions, and reality checks
+
+* **Never overwrite.** `v2`, `v3`, `v4` next to `v1`. Your favourite will often be the
+  third one, and you cannot know in advance which.
+* **Budget an evening.** Roughly six short takes per hour of machine time. A 90-second film
+  is not an afternoon of rendering — it is an afternoon of *choosing* and a night of
+  rendering.
+* **Say the turn out loud** before you publish. If a stranger wouldn't get it in ten
+  seconds, cut the film shorter, not the explanation longer.
+
+---
+
 # Part I — Directing with it
 
-What you actually do, stage by stage. Three things are true of every stage and they
+The guide above is *what* to do and in what order; this is *how*, with the commands and the
+measured numbers behind each stage.
+
+Three things are true of every stage and they
 explain the shape of all the commands:
 
 * **every stage is a one-shot process that exits.** Nothing resident — the host's swap
