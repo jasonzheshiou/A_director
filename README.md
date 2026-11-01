@@ -3,6 +3,26 @@
 Architecture notes and the core code for a two-box setup that renders short films
 with **MiniMax H3** on a single AMD GPU that is *also* the machine's LLM server.
 
+> ### ⚠️ Third-party models — and what they output — are not MIT
+>
+> **Everything this pipeline generates is governed by the licences of the models that
+> produced it, not by this repository's MIT licence.** Nothing here grants you any right
+> to a model weight, to a model's output, or to a voice. Before running any of it — and
+> before publishing or monetising anything it produces — read and comply with the licence
+> and terms of use of **every model you actually invoke**, including the generation
+> checkpoints, their encoders and the serving software. See
+> [Models and their licences](#models-and-their-licences) for the list and what is known.
+>
+> Two consequences people get wrong:
+>
+> * **a non-commercial model's output does not become commercial by post-processing it.**
+>   Mixing, re-encoding, subtitling or re-scoring a clip does not launder its licence.
+> * **a cloned voice needs the speaker's consent** — from whoever the reference clip is
+>   of, including you. That is a separate obligation from any model licence.
+>
+> You are responsible for that compliance. This is not legal advice; if a licence is
+> unclear, do not ship the result.
+
 ---
 
 ## ▶ The film
@@ -34,6 +54,29 @@ with **MiniMax H3** on a single AMD GPU that is *also* the machine's LLM server.
 clip is published as a **non-commercial technical sample**. Clear both licences before
 any commercial use of anything derived from it. MIT here covers `code/`, `tools/` and
 this README — it cannot grant rights the pipeline never owned.
+
+### Models and their licences
+
+This repository **ships no model weights, no voice reference audio and no training data**
+— only orchestration code and one sample clip. Every model below is downloaded and run
+under its own terms by whoever runs it, and its output inherits those terms. Licences
+change; re-check each one at the upstream source before every release, and treat the
+"verify" rows as unpaid homework, not as clean passes.
+
+| component | what it does here | licence status |
+|---|---|---|
+| **MiniMax H3** (`minimax_h3_fl2va_pruned_bf16`) | video + stereo audio generation | MiniMax model terms — **verify** |
+| its text encoder — Qwen3-VL-32B, truncated to 50 language layers | encodes every prompt that shapes a frame | Qwen terms — **verify** |
+| **Qwen-Image-2.1-Turbo** (`qimg`) | keyframe generation | Qwen terms — **verify** |
+| **Qwen3-TTS** 1.7B (base / customvoice / voicedesign) | narration, incl. **voice cloning** | Qwen terms — **verify** + the speaker's consent |
+| **m-a-p/YuE2-3B** + `YuE2-Vae` | the score | **CC-BY-NC-4.0** — non-commercial |
+| the served LLM checkpoints (`:8080`) | the tenant H3 displaces | checkpoint terms — **verify** |
+| **this repository** (`code/`, `tools/`, docs) | orchestration only | **MIT** |
+
+Practical reading: the *code* is free to use, the *outputs* are not automatically yours to
+sell, and the sample film is explicitly non-commercial. Attribution obligations attach to
+several of these at once — when you publish a cut, you are redistributing the work of at
+least a video model, a speech synthesiser and a music model.
 
 ---
 
@@ -465,3 +508,5 @@ alias is neutralised; container and unit names are the real ones.
 3. **Every state must be finishable by someone.** Write what you owe before you take the
    GPU, so recovery is an idempotent converge rather than a replay.
 4. **Order the ladder by cost.** Voice before cut, audio before burn, soft before burned.
+5. **MIT covers the code, not the models or their outputs.** Check every upstream
+   licence before you publish anything this pipeline made.
