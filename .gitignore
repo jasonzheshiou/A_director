@@ -1,0 +1,7 @@
+# Deliberately NOT a media blanket: this repository publishes exactly one sample clip
+# on purpose (sample/). The private working tree it was distilled from ignores all media;
+# this one whitelists a single file, and tools/publish-check.sh enforces that it stays one.
+__pycache__/
+*.pyc
+*.swp
+.DS_Store

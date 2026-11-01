@@ -1,0 +1,892 @@
+#!/usr/bin/env bash
+# ===========================================================================
+# vgen - rent the GPU back from the LLM, render, and give the LLM its box back.
+#
+# Runs on the workstation (192.0.2.158) and drives 192.0.2.59 over the
+# `model-host` ssh alias. One GPU, one box, two mutually exclusive tenants:
+#
+#   the LLM     :8080 - halogen-abl / halogen, served by ~/model-swap
+#   the video   :8189 - MiniMax H3 ComfyUI node, ~/Video_Sandbox
+#
+# H3's ~57.5 GiB of weights cannot coexist with the LLM, so every render is a
+# full handover, and this owns the whole cycle:
+#
+#   llm down -> video up -> render -> clip archived -> llm up
+#
+#   vgen status                       both tenants + the local archive
+#   vgen doctor                       preflight on both sides, changes nothing
+#   vgen render "a prompt" [--seconds 5] [--w 864 --h 480] [--name slug]
+#                                     one clip; --dry-run to plan, --foreground to block
+#                                     --keep-llm-down to chain, --allow-unknown-llm to override
+#   vgen batch --file shots.txt       N prompts, ONE handover ("prompt<TAB>extra args" per line)
+#   vgen film --film actuary_2035     a shot list from .59:films/, stitched by make_film
+#   vgen progress [once]              is a render running, and how far along
+#   vgen watch [secs]                 poll progress until Ctrl-C (default 15s)
+#   vgen dash [secs|once]             live monitor: who owns the GPU, what is
+#                                     rendering, the link, computed verdicts, and
+#                                     a plain-language read from the local 9B
+#   vgen heal                         finish a handover that was interrupted (idempotent)
+#   vgen facts                        machine-readable state, one ssh (bin/vdash serves it)
+#   vgen collect [run-id]             fetch clips a finished-but-uncollected run left on .59
+#   vgen abort                        stop a runaway batch: kill the loop, keep the clips,
+#                                     preserve the unrendered queue, touch nothing else
+#   vgen recover                      abort -> collect -> heal, in one idempotent call
+#   vgen swap-test                    time the handover, render nothing
+#   vgen logs [n]                     tail the newest run log
+#
+# Three rules this script exists to enforce:
+#
+#   1. Restore the model that was actually live, not the one a state file
+#      prefers. The published model id is captured before anything is stopped
+#      and compared byte-for-byte afterwards, so an abliterated box never comes
+#      back serving the stock checkpoint. Anything :8080 answers as that
+#      model-swap cannot restart is refused instead of being stopped blind.
+#   2. Never decide a render is finished by the clock, or by the exit code of a
+#      tunnel. The work is detached on .59, which records its own return code;
+#      completion is the artefact appearing in out/. ssh may die at any point
+#      without changing either the outcome or the verdict.
+#   3. Never leave the box in a state nobody can finish. The owed variant is
+#      written to .59 before anything is stopped, so `vgen heal` - or, with no
+#      workstation at all, `~/host-reset.sh abl` on .59 - closes the handover.
+#      Both are idempotent converges, not a replay of a half-run sequence.
+#
+# Why it is built this way: measured on 2026-10-25, the WiFi link between these
+# two boxes dropped for ~10 minutes in the middle of a 4-minute render. The clip
+# was produced, the ssh carrying it was not, and the single best-effort restore
+# that followed it ran over that same dead tunnel - so the render was reported
+# failed and the LLM stayed down until it was started by hand.
+# ===========================================================================
+set -uo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+REMOTE="${NUCBOX_HOST:-model-host}"
+SANDBOX='~/Video_Sandbox'
+SWAP='~/model-swap'
+TOGGLE='~/model-toggle'
+PORT="${MODEL_PORT:-8080}"
+VIDEO_CONTAINER="${VIDEO_CONTAINER:-video-comfy}"
+STATE="$HERE/state"
+VIDEOS="$HERE/videos"
+JOURNAL="$VIDEOS/index.jsonl"
+LIVE="$STATE/live.env"
+RSDIR='~/.local/state/vgen'          # .59's copy of the handover state
+INTENT="$RSDIR/intent"               # which variant the box is owed
+RESET="${VGEN_RESET:-}"             # cached detect_reset() answer; set to force a path
+SSHCTRL=(                            # one multiplexed link per run, not one per poll
+  -o BatchMode=yes -o ConnectTimeout=10
+  -o ControlMaster=auto
+  -o "ControlPath=$HOME/.cache/vgen/cm-%C"
+  -o ControlPersist=600
+)
+mkdir -p "$STATE" "$VIDEOS" "$HOME/.cache/vgen"
+
+R() { ssh "${SSHCTRL[@]}" "$REMOTE" "$@"; }
+log() { printf '[%s] %s\n' "$(date '+%F %T')" "$*"; }
+fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
+act()  { if (( DRY )); then printf '  [dry-run] %s\n' "$*"; else eval "$@"; fi; }
+usage() { awk '/^# ={5,}/{f=!f;next} f{sub(/^# ?/,"");print}' "$0"; }
+
+# rr <attempts> <delay> <fn> [args...] - a transient link failure is not an
+# outcome. Every call that must land is retried rather than trusted once.
+rr() {
+  local n="$1" delay="$2" i rc=0; shift 2
+  for ((i = 1; i <= n; i++)); do
+    "$@" && return 0
+    rc=$?
+    (( i < n )) && { log "   attempt $i/$n failed (rc=$rc); retrying in ${delay}s"; sleep "$delay"; }
+  done
+  log "   still failing after $n attempts"
+  return $rc
+}
+
+CMD="${1:-status}"; shift || true
+PROMPT="" W=864 H=480 SECS=2 NAME="" DRY=0 FOREGROUND=0 KEEP_DOWN=0 ALLOW_UNKNOWN=0
+FILM="" JOBFILE="" MAXWAIT="" TURBO="" NOWAIT=0 FIRST_FRAME=""
+POS=()          # bare arguments, in order: `dash 5`, `logs 80`, `collect <id>`
+while (( $# )); do
+  case "$1" in
+    --w)                 W="${2:?}"; shift 2 ;;
+    --h)                 H="${2:?}"; shift 2 ;;
+    --seconds|-s)        SECS="${2:?}"; shift 2 ;;
+    --name|-n)           NAME="${2:?}"; shift 2 ;;
+    --film)              FILM="${2:?}"; shift 2 ;;
+    --file)              JOBFILE="${2:?}"; shift 2 ;;
+    --turbo)             TURBO="${2:?}"; shift 2 ;;
+    --first-frame)         FIRST_FRAME="${2:?}"; shift 2 ;;
+    --max-wait)          MAXWAIT="${2:?}"; shift 2 ;;
+    --no-wait)           NOWAIT=1; shift ;;
+    --foreground|-f)     FOREGROUND=1; shift ;;
+    --keep-llm-down)     KEEP_DOWN=1; shift ;;
+    --allow-unknown-llm) ALLOW_UNKNOWN=1; shift ;;
+    --dry-run)           DRY=1; shift ;;
+    --help|-h)           usage; exit 0 ;;
+    -*)                  usage >&2; fail "unknown flag: $1" ;;
+    *)                   POS+=("$1"); PROMPT="${PROMPT:+$PROMPT }$1"; shift ;;
+  esac
+done
+
+# ---- what is live, and can we put it back ----------------------------------
+# The exact id :8080 publishes (e.g. Qwen3.8-Flash-Next-Abliterated). Compact
+# JSON, so a grep beats shipping a parser: "id" cannot false-match "first_id".
+remote_model_id() {
+  R "curl -s -m 5 http://127.0.0.1:$PORT/v1/models" 2>/dev/null \
+    | tr -d '\n' | grep -o '"id":"[^"]*"' | head -1 | cut -d'"' -f4
+}
+# abl | stock | other | none - the same discrimination model-toggle uses.
+remote_llm() {
+  local id="${1:-$(remote_model_id)}"
+  [[ -z $id ]] && { printf 'none'; return; }
+  [[ $id == *Abliterated* ]] && { printf 'abl';   return; }
+  [[ $id == *Flash-Next*   ]] && { printf 'stock'; return; }
+  printf 'other'
+}
+# Rule 1: never stop an LLM this script cannot restart.
+guard_restorable() {
+  local variant="$1" id="$2" recorded=""
+  # The id is interpolated into remote command strings, so it is validated rather
+  # than trusted just because :8080 published it.
+  [[ -z "$id" || "$id" =~ ^[A-Za-z0-9._-]+$ ]] || fail ":$PORT published '$id', which is not a safe model id"
+  [[ -f "$LIVE" ]] && recorded="$(. "$LIVE"; printf '%s' "${variant:-}")"
+  case "$variant" in
+    none)
+      [[ $KEEP_DOWN == 1 || -n "$recorded" ]] && return 0
+      R "test -x $SWAP" || fail "nothing answers :$PORT and $SWAP is missing - nothing to hand back to"
+      fail ":$PORT answers as nothing, yet $SWAP exists - refusing to guess which variant to restore" ;;
+    other)
+      [[ $ALLOW_UNKNOWN == 1 || $KEEP_DOWN == 1 ]] && return 0
+      fail ":$PORT answers as '$id', which model-swap cannot restart (use --allow-unknown-llm)" ;;
+  esac
+}
+
+# Rule 3, recorded where the fixing happens. If .158 dies, reboots or loses its
+# radio mid-handover, .59 still knows which tenant it is owed.
+record_intent() {   # <variant> <model_id>
+  local body="want=$1
+model_id=${2:-none}
+recorded=$(date -Iseconds)
+run=$RUN_ID
+"
+  [[ $DRY == 1 ]] && { printf '  [dry-run] record on .59: owed=%s (%s)\n' "$1" "${2:-none}"; return 0; }
+  R "mkdir -p $RSDIR && cat > $INTENT" <<< "$body" && printf '%s' "$body" > "$STATE/intent.env"
+}
+clear_intent() { R "rm -f $INTENT" >/dev/null 2>&1; rm -f "$STATE/intent.env"; }
+# .59 first: it is the box that has to be fixed, and it may know more than we do.
+owed_variant() {
+  local v
+  v="$(R "sed -n 's/^want=//p' $INTENT 2>/dev/null" 2>/dev/null | head -1)"
+  [[ -n "$v" ]] || v="$(sed -n 's/^want=//p' "$STATE/intent.env" 2>/dev/null | head -1)"
+  printf '%s' "$v"
+}
+owed_id() {
+  local v
+  v="$(R "sed -n 's/^model_id=//p' $INTENT 2>/dev/null" 2>/dev/null | head -1)"
+  [[ -n "$v" ]] || v="$(sed -n 's/^model_id=//p' "$STATE/intent.env" 2>/dev/null | head -1)"
+  printf '%s' "$v"
+}
+
+# One line of live machine state - the answer to "is it actually working yet".
+# gtt is GPU memory and belongs to whichever tenant is resident: ~37 GiB with
+# halogen up, climbing toward ~57 GiB while H3 loads, ~5 GiB mid-render at
+# 864x480. Read it against `video=`/`llm=` rather than as an absolute.
+remote_snapshot() {
+  R bash -s <<'EOS' 2>/dev/null
+n=$(podman inspect -f "{{.State.Status}}" "${VIDEO_CONTAINER:-video-comfy}" 2>/dev/null)
+g=$(awk '{printf "%.1f", $1/1073741824}' /sys/class/drm/card0/device/mem_info_gtt_used 2>/dev/null)
+r=$(awk '/MemAvailable/{printf "%.0f", $2/1048576}' /proc/meminfo 2>/dev/null)
+q=$(wc -l < "$HOME/Video_Sandbox/queue.jsonl" 2>/dev/null)
+c=$(basename "$(ls -1t "$HOME/Video_Sandbox/out/"*.mp4 2>/dev/null | head -1)" 2>/dev/null)
+m=$(curl -s -m 4 http://127.0.0.1:8080/v1/models 2>/dev/null | tr -d '\n' | grep -o '"id":"[^"]*"' | head -1 | cut -d'"' -f4)
+t=$(pgrep -f 'vgen/task-.*\.sh|/task-[0-9].*\.sh' 2>/dev/null | head -1)
+d=$(sed -n 's/^want=//p' "$HOME/.local/state/vgen/intent" 2>/dev/null | head -1)
+printf 'video=%s gtt=%sGiB ram_free=%sGiB queued=%s newest_clip=%s llm=%s task=%s owed=%s\n' \
+  "${n:-absent}" "${g:-?}" "${r:-?}" "${q:-0}" "${c:-none}" "${m:-down}" \
+  "${t:-idle}" "${d:-nothing}"
+EOS
+}
+
+# ---- converge --------------------------------------------------------------
+# host-reset.sh is .59's own release primitive, and every verb of it is a
+# converge: stop all tenants, prove the memory came back, start exactly one
+# thing. That is what makes it safe to re-run, which is what a flaky link needs.
+# The `video`/`model-swap` scripts are the fallback - same effect, no proof.
+detect_reset() { [[ -n $RESET ]] || RESET="$(R 'test -x ~/host-reset.sh && echo yes || echo no' 2>/dev/null)"
+  [[ ${RESET:-no} == yes ]]; }
+
+converge() {   # <video|abl|stock> -> land the box in that state, proven
+  local verb="$1" tries="${VGEN_CONVERGE_TRIES:-5}" delay="${VGEN_CONVERGE_DELAY:-20}" i
+  [[ $DRY == 1 ]] && { printf '  [dry-run] R %s\n' "~/host-reset.sh $verb"; return 0; }
+  if detect_reset; then
+    for ((i = 1; i <= tries; i++)); do
+      # Its exit code already carries rule 1: start_host dies if the box answers
+      # as anything other than the variant it was told to start.
+      R "~/host-reset.sh $verb" && return 0
+      log "   converge to '$verb' attempt $i/$tries failed; retrying in ${delay}s"
+      sleep "$delay"
+    done
+    return 1
+  fi
+  case "$verb" in
+    video)     act "R 'cd $SANDBOX && ./bin/video start'" ;;
+    abl|stock) act "R '$TOGGLE $verb --force'" ;;   # model-toggle owns --force
+  esac
+}
+
+# The step that used to be lost: it ran once, over the tunnel that had just died.
+restore_llm() {   # <variant> <model_id> -> 0 only once .59 proves the exact id
+  local variant="$1" id="$2" rounds="${VGEN_RESTORE_ROUNDS:-3}" delay="${VGEN_RESTORE_DELAY:-30}" i got
+  [[ $KEEP_DOWN == 1 ]] && { log "   LLM left down by request (--keep-llm-down)"; return 0; }
+  [[ $DRY == 1 ]] && { printf '  [dry-run] restore %s and verify the id\n' "$variant"; return 0; }
+  [[ $variant == abl || $variant == stock ]] || { log "   refusing to start unknown variant '$variant'"; return 1; }
+  for ((i = 1; i <= rounds; i++)); do
+    if converge "$variant"; then
+      got="$(remote_model_id)"
+      if [[ -z "$id" || "$got" == "$id" ]]; then log "   restored model id: ${got:-$variant}"; return 0; fi
+      log "   attempt $i: :$PORT answers '${got:-nothing}', wanted '$id'"
+    fi
+    (( i < rounds )) && { log "   restore round $i/$rounds incomplete; retrying in ${delay}s"; sleep "$delay"; }
+  done
+  return 1
+}
+
+# The handover is only ever left open on purpose, and never silently.
+announce() {   # <variant> <model_id> <why>
+  printf '%s\n' \
+    "!! $3, and .59 is not serving ${2:-the model it had}." \
+    "   the clips it rendered are safe on disk; only the handover is unfinished." \
+    "   from the workstation:  bin/vgen heal" \
+    "   on .59 itself, with no ssh at all:  ~/host-reset.sh $1" >&2
+  return 1
+}
+
+# Every exit path funnels through here, so no step can fail without the box being
+# converged back - and the intent is only removed once the id is proven.
+close_out() {   # <variant> <model_id> <why>
+  local v="$1" m="$2"
+  [[ -z "$v" ]] && { log "!! $3"; return 0; }
+  log "!! $3 - returning the box to '$v'"
+  restore_llm "$v" "$m" && { clear_intent; log "   box restored, intent cleared"; return 0; }
+  announce "$v" "$m" "$3"
+}
+
+# ---- the detached run ------------------------------------------------------
+# vgen never holds a command open on .59. It installs a script, starts it under
+# setsid, and afterwards only reads small files. A render can then run for hours
+# while the link comes and goes, and .158 can be switched off entirely.
+task_write() {   # <name> - script body on stdin; .59 records the return code
+  local name="$1" body script
+  body="$(cat)"
+  script="#!/bin/bash
+cd ~/Video_Sandbox || exit 90
+{
+$body
+} 2>&1 | tee $RSDIR/task-$name.log
+echo \"\${PIPESTATUS[0]}\" > $RSDIR/task-$name.rc"
+  R "mkdir -p $RSDIR && cat > $RSDIR/task-$name.sh && chmod 755 $RSDIR/task-$name.sh" <<< "$script"
+}
+task_start() {   # <name> -> setsid, so the tunnel is never the render's parent
+  # setsid --fork with no `&`: measured 0.1s to return, versus 12.7s for
+  # `setsid nohup … &`, because ssh keeps waiting on the channel the backgrounded
+  # job still holds - and it swallows the command's own output along the way.
+  R "cd $RSDIR && setsid --fork ./task-$1.sh >/dev/null 2>&1 </dev/null; echo detached"
+}
+# The [t]rick: a plain pattern matches the very shell running pgrep, which would
+# read as "still alive" for a task that finished an hour ago.
+task_alive() { R "pgrep -f '[t]ask-$1.sh' > /dev/null 2>&1"; }
+newest_run() { ls -1t "$STATE"/run-*.log 2>/dev/null | head -1 | sed 's/.*run-//; s/\.log//'; }
+task_running() { local r; r="$(newest_run)"; [[ -n "$r" ]] && task_alive "$r"; }
+task_rc()    { R "cat $RSDIR/task-$1.rc 2>/dev/null" 2>/dev/null | head -1; }
+task_tail()  { R "tail -n ${3:-4} $RSDIR/task-$1.log 2>/dev/null" 2>/dev/null | tail -n "${3:-4}"; }
+
+# task_wait <name> <limit_secs> <progress_file> -> the recorded rc, or 90 on a
+# timeout that leaves the job running. A poll that fails is a poll, not a result.
+task_wait() {
+  local name="$1" limit="$2" prog="$3" rc now t0; t0="$(date +%s)"
+  while :; do
+    rc="$(task_rc "$name")"
+    if [[ -n "$rc" ]]; then
+      printf '[%s] .59 recorded rc=%s for task %s\n' "$(date '+%T')" "$rc" "$name" >> "$prog"
+      return "$((rc))"
+    fi
+    now="$(date +%s)"
+    if (( now - t0 > limit )); then
+      printf '[%s] still running after %ss; left detached on .59\n' "$(date '+%T')" "$limit" >> "$prog"
+      return 90
+    fi
+    printf '[%s] +%ss %s | %s\n' "$(date '+%T')" "$((now - t0))" \
+      "$(remote_snapshot)" "$(task_tail "$name" 1 | tail -1)" >> "$prog" 2>/dev/null
+    sleep "${VGEN_POLL:-30}"
+  done
+}
+
+# ---- artefacts: the only evidence that counts -------------------------------
+clip_index() { R 'find ~/Video_Sandbox/out -maxdepth 1 -name "*.mp4" -printf "%f|%s\n" 2>/dev/null | sort' 2>/dev/null; }
+new_clips() {   # <before-file> -> names produced since
+  local after; after="$(clip_index)"
+  comm -13 <(cut -d'|' -f1 "$1" | sort) <(printf '%s\n' "$after" | cut -d'|' -f1 | sort)
+}
+fetch_clips() {   # <names...> - pulled before anything is torn down, retried
+  local f rc=0 n=0
+  for f in "$@"; do
+    [[ -z "$f" ]] && continue
+    if rr 4 15 rsync -a -e "ssh ${SSHCTRL[*]}" "$REMOTE:$SANDBOX/out/$f" "$VIDEOS/"; then
+      log "   filed $f"; n=$((n + 1))
+    else rc=1; fi
+  done
+  log "   $n clip(s) archived in $VIDEOS"
+  return $rc
+}
+json_job() {   # <prompt> [args...] -> one queue.jsonl line, quoted properly
+  python3 -c 'import json,sys,time; a=sys.argv; print(json.dumps({"prompt":a[1],"args":a[2:],"play":False,"added":time.strftime("%H:%M:%S")}))' "$@"
+}
+journal_add() {   # <ts> <name> <prompt> <clip> <model_id>
+  python3 - "$JOURNAL" "$@" <<'PY'
+import json, sys
+j, ts, name, prompt, clip, model = sys.argv[1:7]
+with open(j, "a") as f:
+    f.write(json.dumps({"ts": ts, "name": name, "prompt": prompt,
+                        "clip_local": clip, "llm_during": model}) + "\n")
+PY
+}
+
+# phase <label> <cmd> -> run it, log wall time + exit code, propagate rc
+phase() {
+  local label="$1" cmd="$2" t0 t1 rc
+  t0="$(date +%s)"; eval "$cmd" >/dev/null 2>&1; rc=$?; t1="$(date +%s)"
+  printf '[%s]   %-16s %5ds rc=%s\n' "$(date '+%F %T')" "$label" "$((t1 - t0))" "$rc"
+  return $rc
+}
+
+# Cheap checks that apply to every mutating path. Disk is the live risk on .59:
+# 96% used, and a film writes clips continuously.
+preflight_or_die() {
+  rr 3 10 R 'true' || fail "cannot ssh $REMOTE - the link, not the box, is the first suspect"
+  if (( ! DRY )); then
+    R "test -x $SANDBOX/bin/videoq" || fail "$SANDBOX/bin/videoq missing - renders go through the queue now"
+    detect_reset || log "   note: no host-reset.sh on .59 - falling back to the step scripts"
+  fi
+  local free; free="$(R "df -B1 --output=avail /" | tail -1)"
+  (( free > 8589934592 )) || fail "only $((free / 1073741824)) GB free on $REMOTE (needs >8 GB for clips)"
+}
+
+# Rule 1's check, separated from the act of restoring so both can be retried.
+verify_or_log() {
+  local want="$1" got
+  [[ -z "$want" ]] && return 0
+  got="$(remote_model_id)"
+  if [[ "$got" == "$want" ]]; then log "   restored model id: $got"; return 0; fi
+  log "   !! MISMATCH: expected '$want', :$PORT answers '${got:-nothing}'"; return 1
+}
+
+# animate's ceiling, derived from measured cost instead of its 3600 s default.
+# 864x480 / 124 frames / 4 steps / plain rendered in 204 s - about 0.41 s per
+# frame-step - and first-frame conditioning costs 3.4x (38.3 s -> 130.6 s). Two
+# times headroom, plus the ~100 s weight load. Leaving this at the default is what
+# turned 20 successful clips into 20 "FAILED after 3601s" on 2026-10-26.
+anim_timeout() {   # <seconds> <extra-args> -> seconds to allow one render
+  local secs="$1" args="$2" frames steps mult
+  frames="$(awk -v s="$secs" 'BEGIN{printf "%d", s*24+0.5}')"
+  case "$args" in *4step*) steps=4 ;; *) steps=8 ;; esac
+  case "$args" in *--first-frame*) mult=2.8 ;; *) mult=0.82 ;; esac
+  awk -v f="$frames" -v st="$steps" -v m="$mult" 'BEGIN{printf "%d", 300+f*st*m}'
+}
+# The largest --seconds any batch line asks for, so the supervisor is patient enough.
+batch_max_seconds() {
+  local m; m="$(grep -oE -- '--seconds[ =][0-9.]+' "$JOBFILE" 2>/dev/null | grep -oE '[0-9.]+' | sort -n | tail -1)"
+  awk -v a="${m:-0}" -v b="$SECS" 'BEGIN{print (a>b)?a:b}'
+}
+
+# ---- the run ---------------------------------------------------------------
+# One handover, one detached task, a verdict taken from the artefacts.
+do_run() {   # <mode render|batch|film>
+  local mode="$1" mid variant ts logf prog base njobs limit body job rc=0 clips=()
+  mid="$(remote_model_id)"; variant="$(remote_llm "$mid")"
+  guard_restorable "$variant" "$mid"
+  RUN_ID="$(date +%Y%m%d-%H%M%S)"
+  logf="$STATE/run-$RUN_ID.log"; prog="$STATE/run-$RUN_ID.progress"; base="$STATE/run-$RUN_ID.before"
+  (( DRY )) || : > "$logf"   # a dry-run must not leave a phantom run behind
+
+  case "$mode" in
+    render) [[ -n "$PROMPT" ]] || { usage >&2; exit 2; }
+            [[ -n "$NAME" ]] || NAME="$(printf '%s' "$PROMPT" | tr -cs '[:alnum:]' '-' | cut -c1-32 | sed 's/-*$//')"
+            njobs=1
+            body="echo '=== videoq --run (1 job) ==='
+./bin/videoq --run"
+            # A keyframe from qimg turns this into image->video (I2VA): H3 animates
+            # the still instead of inventing one, which is how a storyboard becomes
+            # a film with the same character in every shot.
+            ff=""
+            if [[ -n "$FIRST_FRAME" ]]; then
+              [[ -s "$FIRST_FRAME" ]] || fail "--first-frame '$FIRST_FRAME' is missing or empty"
+              ff="--first-frame $SANDBOX/inbox/$(basename "$FIRST_FRAME")"
+            fi
+            JT="$(anim_timeout "$SECS" "$TURBO $ff")"
+            job="$(json_job "$PROMPT" --w "$W" --h "$H" --seconds "$SECS" ${TURBO:+--turbo "$TURBO"} $ff --timeout "$JT")" ;;
+    batch)  [[ -s "$JOBFILE" ]] || fail "--file '$JOBFILE' is missing or empty"
+            # A line is "prompt<TAB>--flags". The mistake that passes silently is a
+            # label first - "v01<TAB>the whole prompt" - which enqueues the prompt as
+            # animate's argv and fails every job in 0s, after the LLM was already
+            # stopped. Check it here, where being wrong costs nothing.
+            bad="$(awk -F'\t' '!/^[[:space:]]*(#|$)/ && NF>1 && $2 !~ /^[[:space:]]*-/ \
+                     {printf "  line %d: %s\n", NR, $1}' "$JOBFILE")"
+            [[ -z "$bad" ]] || fail "batch file '$JOBFILE' has a 2nd field that is not flags.
+  expected  prompt<TAB>--w 864 --h 480 --seconds 10 --turbo 4step   (flags must start with -)
+  offending lines:
+$bad
+  if the first field is a label, put it inside the prompt instead:  v01 rise-shot: ...<TAB>--seconds 10"
+            njobs="$(grep -cvE '^[[:space:]]*(#|$)' "$JOBFILE")"
+            (( njobs > 0 )) || fail "no jobs in $JOBFILE (a line is a prompt; # lines are ignored)"
+            [[ -n "$NAME" ]] || NAME="$(basename "$JOBFILE" | cut -d. -f1)"
+            body="echo '=== videoq --run ($njobs jobs, one handover) ==='
+for ((i = 1; i <= $njobs; i++)); do echo \"--- job \$i/$njobs \$(date -Iseconds)\"; ./bin/videoq --run; done"
+            JT="$(anim_timeout "$(batch_max_seconds)" "$TURBO")"
+            job="" ;;
+    film)   [[ -n "$FILM" ]] || fail "film mode needs --film <name in .59:Video_Sandbox/films/>"
+            njobs=1; NAME="$FILM"
+            body="echo '=== make_film --film $FILM ==='
+./make_film.py --film $FILM"
+            job="" ;;
+    *) fail "do_run: $mode" ;;
+  esac
+  # A shot is budgeted at 30 min: measured 204 s for a plain 864x480 clip, and
+  # first-frame conditioning (what every chained shot uses) costs ~3.4x that.
+  local ceiling
+  if [[ $mode == film ]]; then ceiling=14400
+  else ceiling=$(( njobs * ${JT:-3600} + 1800 )); fi
+  limit="${MAXWAIT:-$ceiling}"
+
+  if (( DRY )); then
+    log "dry-run: $mode '$NAME' - $njobs job(s), ceiling ${limit}s, one handover"
+    printf '  [dry-run] record on .59: owed=%s (%s)\n' "$variant" "${mid:-none}"
+    printf '  [dry-run] R ~/host-reset.sh video        # llm down, memory proven free, node up\n'
+    [[ -z "$job" ]] || printf '  [dry-run] append to queue.jsonl: %s\n' "$job"
+    [[ $mode == batch ]] && printf '  [dry-run] enqueue %s job(s) from %s\n' "$njobs" "$JOBFILE"
+    printf '  [dry-run] install %s/task-%s.sh, start it with setsid --fork, record its own rc\n' "$RSDIR" "$RUN_ID"
+    printf '  [dry-run] poll for out/*.mp4 and the recorded rc, every %ss\n' "${VGEN_POLL:-30}"
+    printf '  [dry-run] rsync new clips -> %s/videos/\n' "$HERE"
+    printf '  [dry-run] R ~/host-reset.sh %s           # converge back, verify the exact id\n' "$variant"
+    exit 0
+  fi
+
+  # Every line below goes to the run log; the verdict is carried out in RUN_RC so
+  # the redirection cannot swallow it.
+  RUN_RC=0; LEFT=0
+  {
+    log "mode:       $mode ($njobs job(s))  slug: $NAME"
+    [[ -z "$job" ]] || log "first job:  $job"
+    log "canvas:     ${W}x${H}  duration: ${SECS}s   ceiling: ${limit}s"
+    log "live LLM:   $variant ($mid)"
+    clip_index > "$base"
+    log "baseline:   $(wc -l < "$base") clip(s) already in out/"
+    step() { log ">> $1"; eval "$2" || { rc=1; log "!! $1 FAILED"; return 1; }; return 0; }
+    # Push the keyframe before anything is stopped: a missing file should cost a
+    # refused preflight, not a handover.
+    if [[ -n "$FIRST_FRAME" ]]; then
+      R "mkdir -p $SANDBOX/inbox" || { log "!! cannot make $SANDBOX/inbox"; rc=1; RUN_RC=1; }
+      (( rc == 0 )) && step "push keyframe" "rr 3 10 rsync -a -e 'ssh ${SSHCTRL[*]}' $(printf '%q' "$FIRST_FRAME") '$REMOTE:$SANDBOX/inbox/'"
+    fi
+
+    # Nothing is stopped until .59 itself knows what it is owed (rule 3).
+    if ! record_intent "$variant" "$mid"; then
+      log "!! could not record the intent on .59 - aborting before anything is stopped"
+      rc=1; RUN_RC=1
+    fi
+
+    (( rc == 0 )) && step "converge to video" "converge video"
+    if (( rc == 0 )); then
+      if [[ -n "$job" ]]
+      then step "enqueue" "R 'cd $SANDBOX && cat >> queue.jsonl' <<< '$job'"
+      else step "enqueue" "batch_enqueue"
+      fi
+      step "launch render" "task_write '$RUN_ID' <<< \"\$body\" && task_start '$RUN_ID' >/dev/null"
+    fi
+
+    if (( rc == 0 && NOWAIT )); then
+      log ">> --no-wait: launched on .59; nothing was torn down."
+      log "   collect with: $0 collect $RUN_ID   then: $0 heal"
+      LEFT=1
+    elif (( rc == 0 )); then
+      log ">> render detached on .59; polling every ${VGEN_POLL:-30}s (watch: $0 watch)"
+      task_wait "$RUN_ID" "$limit" "$prog"; rc=$?
+      [[ $rc == 90 ]] && log "   ceiling of ${limit}s reached while .59 was still working"
+    fi
+
+    mapfile -t clips < <(new_clips "$base")
+    log "artefacts:  ${#clips[@]} new clip(s) in out/"
+    # The verdict is the artefact plus .59's own record of the exit code - never
+    # whether this particular tunnel happened to survive.
+    if (( ${#clips[@]} == 0 )); then
+      log "!! no new clip (rc=$rc); last lines from .59:"
+      task_tail "$RUN_ID" 8 | sed 's/^/    /'
+      (( rc == 0 || rc == 90 )) && rc=1
+    elif (( rc != 0 && rc != 90 )); then
+      log "   clips exist although the task recorded rc=$rc - archiving them anyway"
+      rc=0
+    fi
+    (( rc == 90 )) || step "fetch clips" "fetch_clips ${clips[*]@Q}"
+
+    if (( rc == 90 )) && task_alive "$RUN_ID"; then
+      log "STILL RUNNING on .59 after ${limit}s - left alone, nothing was torn down."
+      LEFT=1
+    fi
+
+    if (( LEFT == 0 )); then
+      if (( rc == 0 )); then
+        step "restore LLM" "restore_llm '$variant' '$mid'"
+        (( rc == 0 )) && { clear_intent; log "   intent cleared"; }
+        # A batch/film run has no single prompt: name the run instead of filing an
+        # empty one, and keep the shot list in the log where the prompts live.
+        local jp="${PROMPT:-$FILM}"
+        [[ -n "$jp" ]] || jp="($mode: $NAME, $njobs job(s), ${JOBFILE:-films/$FILM.py})"
+        for f in "${clips[@]}"; do
+          journal_add "$RUN_ID" "$NAME" "$jp" "$VIDEOS/${f##*/}" "$mid" 2>/dev/null || true
+        done
+        log "DONE  log: $logf"
+      else
+        # A failed run still owes a working box. close_out attempts the restore and
+        # only announces when that itself fails - announcing alone left .59 serving
+        # nothing after a 20-job batch misfired in 0s on 2026-10-26.
+        close_out "$variant" "$mid" "run did not complete"
+        RUN_RC=1
+      fi
+    fi
+  } >> "$logf" 2>&1
+  printf '%s\n' "$logf"
+  return "${RUN_RC:-$rc}"
+}
+
+# batch: turn JOBFILE lines into queue jobs. "prompt<TAB>--w 864 --seconds 6"
+batch_enqueue() {
+  local line prompt args sec jt
+  while IFS= read -r line; do
+    [[ "$line" =~ ^[[:space:]]*(#|$) ]] && continue
+    prompt="${line%%$'\t'*}"; args="${line#*$'\t'}"
+    [[ "$args" == "$prompt" ]] && args=""
+    sec="$(printf '%s\n' "$args" | awk '{for(i=1;i<=NF;i++) if($i=="--seconds") print $(i+1)}')"
+    jt="$(anim_timeout "${sec:-$SECS}" "$args")"
+    case "$args" in *--timeout*) ;; *) args="$args --timeout $jt" ;; esac
+    json_job "$prompt" $args
+  done < "$JOBFILE" | R 'cd ~/Video_Sandbox && cat >> queue.jsonl'
+}
+
+# ---- advising: the local standby, kept in its place -------------------------
+# Measured on 2026-10-25, asked cold about the 11:16 failure, the 9B on this
+# box's GTX 1080 got the *cause* right ("workstation dropped its Wi-Fi
+# association during the long render") and the *verdict* wrong twice: it called
+# the render failed while the clip existed, and said the box was idle while its
+# LLM was down. So: the rules below own state and actions, and the model only
+# explains. Its text is printed, never executed - and rule 3 of this file says a
+# swap happens when a human asks, so nothing here mutates anything by itself.
+LLM="${VGEN_LLM:-http://127.0.0.1:8190}"
+llm_up() { curl -s -m 3 "$LLM/v1/models" 2>/dev/null | grep -qo '"id":"[^"]*"'; }
+llm_id() { curl -s -m 3 "$LLM/v1/models" 2>/dev/null | grep -o '"id":"[^"]*"' | head -1 | cut -d'"' -f4; }
+llm_advise() {   # <prompt> -> a short plain-language read, or nothing
+  local out="" body mid
+  llm_up || { printf '  (no local standby on %s - start it with: bash ~/ai/text/start.sh)\n' "$LLM"; return 0; }
+  # The prompt travels as an argument, never on stdin: stdin here belongs to the
+  # caller, and reading from it made the model greet a question it never received.
+  mid="$(llm_id)"
+  body="$(python3 -c '
+import json, sys
+print(json.dumps({"model": sys.argv[1], "messages": [{"role": "user", "content": sys.argv[2]}],
+                  "max_tokens": int(sys.argv[3]), "temperature": 0.2,
+                  "chat_template_kwargs": {"enable_thinking": False}}))' "${mid:-local}" "$1" "${VGEN_LLM_TOKENS:-300}")"
+  out="$(curl -s -m "${VGEN_LLM_TIMEOUT:-90}" "$LLM/v1/chat/completions" -H 'Content-Type: application/json' -d "$body" 2>/dev/null \
+    | python3 -c 'import json,sys
+try: print((json.load(sys.stdin)["choices"][0]["message"].get("content") or "").strip())
+except Exception: pass')"
+  if [[ -n "$out" ]]; then printf '  %s\n' "$out" | sed 's/^  /  /'; else printf '  (standby gave no usable answer)\n'; fi
+}
+
+# ---- the dashboard's facts: one ssh per refresh -----------------------------
+# Deliberately a single remote call returning key=value lines. A dashboard that
+# makes eight ssh round-trips per frame is the thing that fails when the radio
+# gets shaky, and it would be reading a torn picture anyway.
+dash_facts() {   # <run-id>
+  R bash -s -- "${1:-none}" <<'EOS'
+node=$(podman inspect -f "{{.State.Status}}" "${VIDEO_CONTAINER:-video-comfy}" 2>/dev/null)
+gtt=$(awk '{printf "%.1f", $1/1073741824}' /sys/class/drm/card0/device/mem_info_gtt_used 2>/dev/null)
+ram=$(awk '/MemAvailable/{printf "%.0f", $2/1048576}' /proc/meminfo 2>/dev/null)
+q=$(wc -l < "$HOME/Video_Sandbox/queue.jsonl" 2>/dev/null)
+m=$(curl -s -m 4 http://127.0.0.1:8080/v1/models 2>/dev/null | tr -d '\n' | grep -o '"id":"[^"]*"' | head -1 | cut -d'"' -f4)
+tp=$(pgrep -f "[t]ask-$1.sh" 2>/dev/null | head -1)
+rc=$(cat "$HOME/.local/state/vgen/task-$1.rc" 2>/dev/null)
+clips=$(find "$HOME/Video_Sandbox/out" -maxdepth 1 -name '*.mp4' 2>/dev/null | wc -l)
+disk=$(df -h / 2>/dev/null | awk 'NR==2{print $4}')
+owed=$(sed -n 's/^want=//p' "$HOME/.local/state/vgen/intent" 2>/dev/null | head -1)
+tail=$(tail -2 "$HOME/.local/state/vgen/task-$1.log" 2>/dev/null | tr '\n' ' | ')
+printf 'node=%s\ngtt=%s\nram=%s\nqueue=%s\nllm=%s\ntask=%s\nrc=%s\nclips=%s\ndisk=%s\nowed=%s\ntail=%s\n' \
+  "${node:-absent}" "${gtt:-?}" "${ram:-?}" "${q:-0}" "${m:-down}" \
+  "${tp:-idle}" "${rc:-none}" "$clips" "${disk:-?}" "${owed:-nothing}" "$tail"
+EOS
+}
+
+# State and next step come from measurements, not opinions. Prints LEVEL|what|do
+verdict_lines() {   # reads the caller's fk() facts
+  local node gtt llm owed rc task queue disk variant
+  node="$(fk node)"; gtt="$(fk gtt)"; llm="$(fk llm)"; owed="$(fk owed)"
+  rc="$(fk rc)"; task="$(fk task)"; queue="$(fk queue)"; disk="$(fk disk)"
+  variant=none; [[ "$llm" == down ]] || variant="$(remote_llm "$llm")"
+  [[ $variant == none && $owed != nothing ]] && printf 'CRITICAL|:%s serves nothing and a handover is unfinished (owed %s)|bin/vgen heal\n' "$PORT" "$owed"
+  [[ $variant == other ]] && printf 'CRITICAL|:%s answers as "%s", which model-swap cannot restart|look before swapping\n' "$PORT" "$llm"
+  [[ $variant != none && $variant != other && $owed != nothing ]] \
+    && printf 'INFO|%s is live again but the intent was never cleared|bin/vgen heal (it only clears)\n' "$variant"
+  [[ $task != idle && $rc == none ]] && printf 'OK|render running on .59 (pid %s) - detached, this PC can die|bin/vgen watch\n' "$task"
+  [[ $rc != none && $rc != 0 ]] && printf 'FAIL|the task on .59 recorded rc=%s|bin/vgen logs\n' "$rc"
+  (( ${NEW_ARCH:-0} < ${NEW_REMOTE:-0} )) && printf 'WARN|%s rendered clip(s) not archived locally|bin/vgen collect %s\n' "$((NEW_REMOTE-NEW_ARCH))" "${RUN_ID:-}"
+  (( ${FREE_GIB:-99} < 8 )) && printf 'CRITICAL|only %s free on .59|%s out/ before rendering\n' "$disk" 'clear'
+  [[ $node == running && $variant != none ]] && printf 'WARN|both tenants resident: gtt %s GiB with an LLM live|likely stranded memory, check podman ps\n' "$gtt"
+  return 0
+}
+
+# ---- commands --------------------------------------------------------------
+case "$CMD" in
+  status)
+    echo "=== local archive ($HERE) ==="
+    printf '  clips:  %s mp4, %s total\n' "$(find "$VIDEOS" -name '*.mp4' 2>/dev/null | wc -l)" "$(du -sh "$VIDEOS" 2>/dev/null | cut -f1)"
+    [[ -f "$JOURNAL" ]] && { echo "  journal:"; tail -3 "$JOURNAL" | sed 's/^/    /'; }
+    echo "=== $REMOTE ==="
+    printf '  %s\n' "$(remote_snapshot)"
+    v="$(owed_variant)"; [[ -n "$v" ]] && printf '  OWED: a handover is unfinished (want=%s id=%s)\n' "$v" "$(owed_id)"
+    [[ -f "$LIVE" ]] && { echo "  recorded in state/live.env:"; sed 's/^/    /' "$LIVE"; }
+    R "$SWAP status 2>&1 | sed 's/^/  /'" 2>/dev/null || echo "  model-swap unreachable"
+    ;;
+
+  doctor)
+    R 'true' >/dev/null 2>&1 || fail "cannot ssh $REMOTE"
+    printf '  ssh %-12s ......... ok (multiplexed)\n' "$REMOTE"
+    R "test -d $SANDBOX && printf '  Video_Sandbox ........ ok\n' || printf '  Video_Sandbox ........ MISSING\n'"
+    R "test -x $SANDBOX/bin/animate && printf '  bin/animate .......... ok\n' || printf '  bin/animate .......... MISSING\n'"
+    R "test -x $SANDBOX/bin/videoq && printf '  bin/videoq ........... ok\n' || printf '  bin/videoq ........... MISSING\n'"
+    R "test -f $SANDBOX/make_film.py && printf '  make_film.py ......... ok\n' || printf '  make_film.py ......... MISSING\n'"
+    R "test -x $SWAP && printf '  model-swap ........... ok\n' || printf '  model-swap ........... MISSING\n'"
+    R "test -x $TOGGLE && printf '  model-toggle ......... ok\n' || printf '  model-toggle ......... MISSING\n'"
+    if detect_reset; then printf '  host-reset.sh ........ ok (converge available)\n'
+    else printf '  host-reset.sh ........ MISSING - falling back to the step scripts, no memory proof\n'
+    fi
+    id="$(remote_model_id)"; v="$(remote_llm "$id")"
+    [[ -n "$id" ]] && printf '  live LLM ............. %s (%s)\n' "$v" "$id" || printf '  live LLM ............. (nothing on :%s)\n' "$PORT"
+    o="$(owed_variant)"; [[ -n "$o" ]] && printf '  UNFINISHED HANDOVER .. owed %s (run: bin/vgen heal)\n' "$o"
+    R "grep -E '^MemAvailable' /proc/meminfo | awk '{printf \"  MemAvailable ......... %.0f GB\n\", \$2/1048576}'"
+    R "df -h / | tail -1 | awk '{printf \"  disk free ............ %s (%s used)\\n\", \$4, \$5}'"
+    printf '  link quality ....... '
+    ping -c 3 -W 2 192.0.2.59 2>/dev/null | awk '/rtt|round-trip/{print $4" "$5}' || printf '(ping failed)\n'
+    ;;
+
+  render)
+    [[ -n "$PROMPT" ]] || { usage >&2; exit 2; }
+    preflight_or_die
+    do_run render
+    ;;
+
+  batch)
+    [[ -s "$JOBFILE" ]] || { usage >&2; fail "batch needs --file <shots.txt>: prompt[tab]extra args per line"; }
+    preflight_or_die
+    do_run batch
+    ;;
+
+  film)
+    [[ -n "$FILM" ]] || { usage >&2; fail "film needs --film <name>"; }
+    preflight_or_die
+    do_run film
+    ;;
+
+  heal)
+    v="$(owed_variant)"; m="$(owed_id)"
+    [[ -n "$v" ]] || { echo "nothing is owed: no interrupted handover on .59 or in state/intent.env"
+                      printf '  current: %s\n' "$(remote_snapshot)"; exit 0; }
+    # If the box already answers as the owed id, converging would take it down to
+    # prove a point. Clear the record and leave a working server running.
+    if [[ -n "$m" && "$(remote_model_id)" == "$m" ]] && ! task_running; then
+      echo "already serving $m - the intent was left over from an interrupted run; clearing it"
+      clear_intent; exit 0
+    fi
+    echo "finishing the handover .59 is owed: want=$v id=${m:-unknown}"
+    printf '  %s\n' "$(remote_snapshot)"
+    restore_llm "$v" "$m" && { clear_intent; echo "  done - $v serving :$PORT again"; exit 0; }
+    echo "  heal did not land. The box is still not serving ${m:-$v}."
+    echo "  on .59, from a terminal:  ~/host-reset.sh $v"
+    exit 1
+    ;;
+
+  collect)
+    rid="${POS[0]:-$(ls -1t "$STATE"/run-*.before 2>/dev/null | head -1 | sed 's/.*run-//; s/\.before//')}"
+    [[ -n "$rid" && -f "$STATE/run-$rid.before" ]] || fail "no run to collect from (pass a run id)"
+    mapfile -t clips < <(new_clips "$STATE/run-$rid.before")
+    (( ${#clips[@]} )) || { echo "  no new clips in out/ since run $rid started"; exit 0; }
+    echo "  ${#clips[@]} clip(s) waiting from run $rid:"; printf '    %s\n' "${clips[@]}"
+    fetch_clips "${clips[@]}"
+    [[ -f "$STATE/run-$rid.log" ]] || log "note: run $rid has no local log - it was launched by another machine or an older build"
+    ;;
+
+  facts)
+    # Machine-readable state for bin/vdash (and scripts). Same numbers the
+    # dashboard shows, one ssh, no colour, no cursor movement.
+    RUN_ID="$(newest_run)"
+    F="$(dash_facts "$RUN_ID")"
+    fk() { printf '%s\n' "$F" | sed -n "s/^$1=//p" | head -1; }
+    NEW_REMOTE=0; NEW_ARCH=0; CLIPNAMES=""
+    if [[ -n "$RUN_ID" && -f "$STATE/run-$RUN_ID.before" ]]; then
+      mapfile -t _nc < <(new_clips "$STATE/run-$RUN_ID.before")
+      NEW_REMOTE=${#_nc[@]}
+      for _f in "${_nc[@]:-}"; do [[ -f "$VIDEOS/$_f" ]] && NEW_ARCH=$((NEW_ARCH + 1)); done
+      CLIPNAMES="$(printf '%s,' "${_nc[@]:-}")"; CLIPNAMES="${CLIPNAMES%,}"
+    fi
+    FREE_GIB="$(printf '%s' "$(fk disk)" | tr -dc '0-9')"
+    printf 'run=%s\narchived=%s\nnew_remote=%s\nnew_clips=%s\n' "$RUN_ID" "$NEW_ARCH" "$NEW_REMOTE" "$CLIPNAMES"
+    printf '%s\n' "$F"
+    printf 'local_clips=%s\n' "$(find "$VIDEOS" -name '*.mp4' 2>/dev/null | wc -l)"
+    printf 'journal_lines=%s\n' "$(wc -l < "$JOURNAL" 2>/dev/null || echo 0)"
+    printf 'keyframes_remote=%s\n' "$(R "find ~/Image_Sandbox/out -name '*.png' 2>/dev/null | wc -l" 2>/dev/null)"
+    printf 'host_free_gib=%s\n' "$(awk '/MemAvailable/{printf "%.0f", $2/1048576}' /proc/meminfo)"
+    printf 'wifi=%s\n' "$(iw wlp9s0 link 2>/dev/null | awk '/SSID:/{ssid=$2} /freq:/{f=$2} /rx bitrate:/{r=$3} END{if(ssid!="")printf "%s @%sMHz %s Mb/s", ssid, f, r; else print "not associated"}')"
+    printf 'rtt_ms=%s\n' "$(ping -c 1 -W 2 192.0.2.59 2>/dev/null | awk -F'/' '/rtt|round-trip/{print $5}')"
+    printf 'standby=%s\n' "$(llm_up && printf 'up %s' "$(llm_id)" || echo down)"
+    # What the standby could be switched to, so the runbook answer is specific.
+    sblist="$(find "$HOME/ai/text/models" -maxdepth 1 -name '*.gguf' ! -name 'current.gguf' -printf '%f ' 2>/dev/null)"
+    sbcur="$(basename "$(readlink -f "$HOME/ai/text/models/current.gguf" 2>/dev/null)" 2>/dev/null)"
+    printf 'standby_models=%s\nstandby_current=%s\n' "${sblist:-none}" "${sbcur:-none}"
+    printf 'poll_at=%s\n' "$(date -Iseconds)"
+    V="$(verdict_lines)"
+    while IFS= read -r v; do [[ -n "$v" ]] && printf 'VERDICT|%s\n' "$v"; done <<< "$V"
+    true                     # no findings must not read as a failed poll
+    ;;
+
+  dash)
+    # A monitor that lives on this PC and reads .59 on demand. Read-only: it
+    # never converges, stops or starts anything, because a swap happens when a
+    # human asks - so it reports, explains, and hands you the command.
+    every="${POS[0]:-10}"; [[ "${POS[0]:-}" == once ]] && every=0
+    adv=""; adv_sig="never"
+    trap 'printf "\n  (dashboard closed; anything running on .59 keeps running)\n"; exit 0' INT TERM
+    while :; do
+      RUN_ID="$(newest_run)"
+      F="$(dash_facts "$RUN_ID")"
+      fk() { printf '%s\n' "$F" | sed -n "s/^$1=//p" | head -1; }
+      NEW_REMOTE=0; NEW_ARCH=0; NEWNAMES=""
+      if [[ -n "$RUN_ID" && -f "$STATE/run-$RUN_ID.before" ]]; then
+        mapfile -t _nc < <(new_clips "$STATE/run-$RUN_ID.before")
+        NEW_REMOTE=${#_nc[@]}
+        for _f in "${_nc[@]}"; do [[ -f "$VIDEOS/$_f" ]] && NEW_ARCH=$((NEW_ARCH + 1)); done
+        NEWNAMES="$(printf '%s ' "${_nc[@]:-}")"
+      fi
+      FREE_GIB="$(printf '%s' "$(fk disk)" | tr -dc '0-9')"
+      V="$(verdict_lines)"
+      st="${RUN_ID:0:4}-${RUN_ID:4:2}-${RUN_ID:6:2} ${RUN_ID:9:2}:${RUN_ID:11:2}:${RUN_ID:13:2}"
+      el="?"; [[ -n "$RUN_ID" ]] && el="$(( ( $(date +%s) - $(date -d "$st" +%s 2>/dev/null || date +%s) ) / 60 ))m"
+      sig="$(printf '%s' "$V" | md5sum | cut -c1-12)"
+      if [[ "$sig" != "$adv_sig" ]]; then
+        adv_sig="$sig"
+        adv="$(llm_advise "These measurements about 192.0.2.59 and a video render were taken by scripts, and the verdicts are computed, not guessed:
+$(printf '%s\n' "$F" | tr '\n' ';')
+LOCAL ARCHIVE: $NEW_ARCH of $NEW_REMOTE new clip(s) fetched; run $RUN_ID started $st ($el ago)
+VERDICTS:
+$V
+
+In at most 3 short lines, for an operator: what is the situation, what if anything is wrong, and what to do next. Do not contradict the verdicts - if they say an LLM is down, it is down. If everything is fine, say so in one line.")"
+      fi
+      [[ $every == 0 ]] || printf '\033[H\033[2J'
+      printf '  vgen monitor  %s  @ %s      run %s (%s, %s elapsed)\n' "$REMOTE" "$(date '+%T')" "${RUN_ID:-none}" "$(fk node)" "$el"
+      printf '  %s\n' "------------------------------------------------------------------------"
+      printf '  %-12s %-12s %s\n' TENANT STATE DETAIL
+      printf '  %-12s %-12s %s\n' "LLM :$PORT" \
+        "$([[ "$(fk llm)" == down ]] && echo DOWN || echo UP)" \
+        "$([[ "$(fk llm)" == down ]] && printf 'owed: %s' "$(fk owed)" || printf '%s' "$(fk llm)")"
+      printf '  %-12s %-12s %s\n' "video :8189" "$(fk node)" "queue $(fk queue) job(s) · $(fk clips) clips on .59 · disk $(fk disk) free"
+      printf '  %-12s %-12s %s\n' "gpu owner" "$(fk gtt) GiB" "ram free $(fk ram) GiB (LLM resident ~37, H3 loading ~55)"
+      printf '  %-12s %-12s %s\n' "render" "$([[ "$(fk task)" != idle ]] && echo RUNNING || echo idle)" \
+        "$([[ "$(fk task)" != idle ]] && printf 'pid %s, rc pending' "$(fk task)" || printf 'rc=%s' "$(fk rc)")"
+      printf '    %s\n' "$(fk tail | cut -c1-108)"
+      printf '  %-12s %s\n' "this run" "$NEW_REMOTE new clip(s) on .59, $NEW_ARCH archived locally ${NEWNAMES:+[$NEWNAMES]}"
+      printf '  %s\n' "------------------------------------------------------------------------"
+      printf '  link    %s %s %s\n' \
+        "$(iw wlp9s0 link 2>/dev/null | awk '/SSID:/{ssid=$2} /freq:/{f=$2} /rx bitrate:/{r=$3} END{if(ssid!="")printf "%s @%sMHz %s Mb/s", ssid, f, r; else print "not associated"}')" \
+        "$(ping -c 1 -W 2 192.0.2.59 2>/dev/null | awk -F'/' '/rtt|round-trip/{printf "rtt %sms", $5}')" \
+        "$(ssh -o "ControlPath=$HOME/.cache/vgen/cm-%C" -O check "$REMOTE" 2>/dev/null && echo 'mux alive' || echo 'mux cold')"
+      printf '  standby %s\n' "$(llm_up && echo "9B up on $LLM (explains, never decides)" || echo '9B down - bash ~/ai/text/start.sh')"
+      printf '  %s\n' "------------------------------------------------------------------------"
+      if [[ -n "$V" ]]; then
+        while IFS='|' read -r lvl what plan; do printf '  %-8s %s\n            -> %s\n' "$lvl" "$what" "$plan"; done <<< "$V"
+      else printf '  OK       nothing abnormal measured\n'; fi
+      [[ -n "$adv" ]] && printf '  advisory (local 9B, last state change):\n%s\n' "$(printf '%s\n' "$adv" | sed 's/^/    /')"
+      (( every == 0 )) && break
+      sleep "$every"
+    done
+    ;;
+
+  abort)
+    # Stop a runaway batch without losing anything already rendered. The order is
+    # deliberate: kill the loop first so no new job is claimed, then the poller,
+    # and leave the container alone - stopping it would kill the in-flight render
+    # mid-write. The queue is preserved, never deleted: those are shot variants
+    # someone chose. Measured need: 2026-10-26, a 20-variant batch whose jobs all
+    # hit animate's default ceiling and re-queued behind the running render.
+    log "abort: stopping the local supervisor"
+    pkill -f 'bin/vgen (batch|render|film)' 2>/dev/null && log "   a local run was supervising; it is stopped"
+    log "   stopping the render loop on .59"
+    R "pkill -f '[t]ask-[0-9]' && sleep 2; pkill -f '[v]ideoq --run'; pkill -f '[b]in/animate'; sleep 2; pkill -9 -f '[t]ask-[0-9]' 2>/dev/null; pkill -9 -f '[v]ideoq --run' 2>/dev/null; true"
+    q="$(R "wc -l < $SANDBOX/queue.jsonl 2>/dev/null" | tr -d '[:space:]')"
+    if [[ -n "$q" && "$q" != "0" ]]; then
+      R "cd $SANDBOX && cp queue.jsonl queue.jsonl.abandoned-\$(date +%Y%m%d-%H%M%S) && : > queue.jsonl"
+      log "   preserved $q unrendered job(s) in .59:~/Video_Sandbox/queue.jsonl.abandoned-*"
+    fi
+    log "   state now: $(remote_snapshot)"
+    log "   nothing was torn down - the node keeps whatever it has. Finish with: $0 collect && $0 heal"
+    ;;
+
+  recover)
+    # The whole unwinding sequence, idempotent and safe to re-run from any state.
+    log "recover: abort -> collect -> heal"
+    "$0" abort
+    "$0" collect || log "   (nothing new to collect)"
+    "$0" heal
+    ;;
+
+  swap-test)
+    # Time the real handover with no render, so the cost is minutes of downtime
+    # instead of a clip. Both halves are converges, so this is re-runnable.
+    ts="$(date +%Y%m%d-%H%M%S)"; logf="$STATE/swap-test-$ts.log"
+    R 'true' >/dev/null 2>&1 || fail "cannot ssh $REMOTE"
+    mid="$(remote_model_id)"; variant="$(remote_llm "$mid")"
+    guard_restorable "$variant" "$mid"
+    RUN_ID="swaptest-$ts"
+    printf 'variant=%s\nmodel_id=%s\nat=%s\n' "$variant" "$mid" "$(date -Iseconds)" > "$LIVE"
+    {
+      log "swap-test: live LLM is '$variant' ($mid); timing each converge, rendering nothing"
+      record_intent "$variant" "$mid" || fail "cannot record intent on .59 - not touching anything"
+      phase "to video"  "converge video"  || { log "!! the box would not land on the video node"; close_out "$variant" "$mid" "swap-test aborted at 'to video'"; exit 1; }
+      R "cd $SANDBOX && ./bin/video status 2>&1 | sed 's/^/    /'" 2>/dev/null || echo "    (video status unreadable)"
+      phase "to LLM"    "restore_llm '$variant' '$mid'" || log "   the LLM did not come back on the first pass"
+      verify_or_log "$mid" || log "!! the box came back as a different model than it was found as"
+      log "DONE  log: $logf"
+    } > "$logf" 2>&1
+    echo "$logf"
+    tail -12 "$logf"
+    ;;
+
+  progress)
+    printf '=== %s @ %s ===\n' "$REMOTE" "$(date '+%F %T')"
+    printf '  %s\n' "$(remote_snapshot)"
+    v="$(owed_variant)"; [[ -n "$v" ]] && printf '  OWED: unfinished handover (want=%s id=%s) -> run: %s heal\n' "$v" "$(owed_id)" "$0"
+    rid="$(ls -1t "$STATE"/run-*.log 2>/dev/null | head -1 | sed 's/.*run-//; s/\.log//')"
+    if [[ -n "$rid" ]] && task_alive "$rid"; then
+      echo "  task $rid is running on .59:"
+      task_tail "$rid" 6 | sed 's/^/    /'
+      p="$STATE/run-$rid.progress"
+      [[ -f "$p" ]] && { echo "  recent samples:"; tail -3 "$p" | sed 's/^/    /'; }
+    fi
+    f="$(ls -1t "$STATE"/run-*.log "$STATE"/swap-test-*.log 2>/dev/null | head -1)"
+    [[ -n "$f" && "${f##*/}" != "run-$rid.log" ]] && printf '  last finished run: %s\n    %s\n' "${f##*/}" "$(tail -1 "$f")"
+    ;;
+
+  watch)
+    every="${POS[0]:-15}"
+    while :; do clear 2>/dev/null || printf '\033[H\033[2J'; "$0" progress; sleep "$every"; done
+    ;;
+
+  logs)
+    f="$(ls -1t "$STATE"/run-*.log "$STATE"/swap-test-*.log 2>/dev/null | head -1)"
+    [[ -n "$f" ]] && { echo "--- $f"; tail -n "${POS[0]:-40}" "$f" | sed 's/^/  /'; } || echo "no runs yet"
+    ;;
+
+  *) usage >&2; exit 2 ;;
+esac

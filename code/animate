@@ -1,0 +1,319 @@
+#!/usr/bin/env python3
+"""animate - render one MiniMax H3 clip (video + stereo audio) on the local node.
+
+  animate --check                       # are the weights visible?
+  animate "a red panda on a mossy log, cinematic"
+  animate --seconds 5 --turbo 4 "a dragon made of clouds"
+  animate --first-frame ../AI_Sandbox/story/out/story_00085_.png "this dinosaur runs"
+  animate --w 768 --h 432 --seconds 1 "a small robot waves"      # fast plumbing test
+
+Prints the output path on the last line of stdout and timing on stderr, so it
+composes:  wall play "$(animate --seconds 2 'a snowglobe')"
+
+Everything is relative to this file's own directory, and the only service it
+talks to is the ComfyUI at 127.0.0.1:8189 (override with VIDEO_COMFY). It has no
+relationship to the Story Wall project beyond sharing a GPU.
+
+Graph notes for anyone tempted to "simplify" this:
+  - CLIPLoader type MUST be "minimax". The text encoder is a Qwen3-VL-32B
+    truncated to 50 language layers, exported without the final LM norm, with its
+    vision tower and three DeepStack mergers intact - a generic Qwen3-VL will not
+    substitute, and the wrong type fails at tokenize time, not load time.
+  - cfg is 1.0 and not a stylistic choice: H3 is distilled and cfg-free. The
+    negative branch is not evaluated at 1.0, which is why it is wired to the
+    positive conditioning - KSampler's schema still requires the input.
+  - The AV latent is a NestedTensor pair (video [B,24,T,H/16,W/16] plus audio
+    [B,32,2,T40]) decoded by two different VAEs, so one sampler feeds both a
+    VAEDecode and a VAEDecodeAudio. Frames snap up to a 17k+5 grid at 24 fps.
+  - shift_video/shift_audio drive the flow schedule (12.0/3.0 defaults) and are
+    also handed to the DiT, which derives the audio schedule from the video one.
+    Changing one without the other desyncs the sound from the picture.
+  - SaveVideo needs `codec` as well as `format` in ComfyUI 0.31; omitting it
+    executes every other node and then fails at the write.
+"""
+import argparse, http.client, json, os, subprocess, sys, time
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+SANDBOX = os.path.dirname(HERE)
+SERVER = os.environ.get("VIDEO_COMFY", "127.0.0.1:8189")
+CONTAINER = os.environ.get("VIDEO_CONTAINER", "video-comfy")
+OUT_DIR = os.path.join(SANDBOX, "out")
+
+UNET = "minimax_h3_fl2va_pruned_bf16.safetensors"
+TE = "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors"
+VVAE = "minimax_h3_video_vae_fp16.safetensors"
+AVAE = "minimax_h3_audio_vae_fp32.safetensors"
+LORAS = {"8step": "minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors",
+         "4step": "minimax_h3_fl2v_turbo_4step_v1.0_768p_comfyui_bf16.safetensors",
+         "none": None}
+FPS = 24            # fixed by the model
+CANVAS_MULTIPLE = 32
+
+
+def post(path, payload):
+    host, port = SERVER.split(":")
+    c = http.client.HTTPConnection(host, int(port), timeout=30)
+    c.request("POST", path, json.dumps(payload).encode(), {"Content-Type": "application/json"})
+    r = c.getresponse(); data = r.read().decode(); c.close()
+    return r.status, data
+
+
+def get(path):
+    host, port = SERVER.split(":")
+    c = http.client.HTTPConnection(host, int(port), timeout=30)
+    c.request("GET", path); r = c.getresponse(); data = r.read().decode(); c.close()
+    return json.loads(data) if data else {}
+
+
+def get_soft(path):
+    """ComfyUI does not answer HTTP while it is sampling, so a poll either hangs or
+    times out - and a render that outlives its client is not a failed render. Retry
+    patiently and give up only after ten consecutive failures."""
+    for _ in range(10):
+        try:
+            return get(path)
+        except Exception:
+            time.sleep(6)
+    return None
+
+
+def snap_frames(n):
+    """H3 only accepts 17k+5 frames; the node rounds up, so do the same for the report."""
+    while n % 17 != 5:
+        n += 1
+    return n
+
+
+def check():
+    """Report what ComfyUI can actually see, before wasting a long render on a typo."""
+    visible = {}
+    for node, key, want in (("UNETLoader", "unet_name", UNET),
+                            ("CLIPLoader", "clip_name", TE),
+                            ("VAELoader", "vae_name", VVAE),
+                            ("VAELoader", "vae_name", AVAE)):
+        try:
+            combos = get(f"/object_info/{node}")[node]["input"]["required"][key][0]
+            visible[want] = want in combos
+        except Exception as e:
+            visible[want] = f"query failed: {e}"
+    for name in LORAS.values():
+        if not name:
+            continue
+        try:
+            combos = get("/object_info/LoraLoader")["LoraLoader"]["input"]["required"]["lora_name"][0]
+            visible[name] = name in combos
+        except Exception as e:
+            visible[name] = f"query failed: {e}"
+    ok = True
+    for k, v in visible.items():
+        mark = "ok  " if v is True else ("--   " if v is False else "??   ")
+        if v is not True:
+            ok = False
+        print(f"  {mark}{k}")
+    if not ok:
+        print(f"\n  missing files: run ./fetch_models.sh first.")
+        print("  New files inside an already-registered directory are picked up on the")
+        print("  next query; only a changed extra_model_paths.yaml needs a restart.")
+    return 0 if ok else 1
+
+
+def build(prompt, w, h, frames, steps, seed, turbo, first_frame=None,
+          shift_video=12.0, shift_audio=3.0, audio=True, sampler="euler",
+          scheduler="simple", codec="auto", last_frame=None):
+    g = {
+        "1": {"class_type": "UNETLoader", "inputs": {"unet_name": UNET, "weight_dtype": "default"}},
+        "2": {"class_type": "CLIPLoader", "inputs": {"clip_name": TE, "type": "minimax"}},
+        "3": {"class_type": "VAELoader", "inputs": {"vae_name": VVAE}},
+    }
+    model_src, clip_src = ["1", 0], ["2", 0]
+    if LORAS[turbo]:
+        g["4"] = {"class_type": "LoraLoader",
+                  "inputs": {"lora_name": LORAS[turbo], "strength_model": 1.0,
+                             "strength_clip": 1.0, "model": model_src, "clip": clip_src}}
+        model_src, clip_src = ["4", 0], ["4", 1]
+    g["5"] = {"class_type": "MiniMaxH3SigmaShift",
+              "inputs": {"model": model_src, "shift_video": shift_video,
+                         "shift_audio": shift_audio}}
+
+    cond = {"clip": clip_src, "vae": ["3", 0], "prompt": prompt,
+            "width": w, "height": h, "length": frames}
+    if first_frame:
+        cond["first_frame"] = ["21", 0]
+        g["21"] = {"class_type": "LoadImage", "inputs": {"image": first_frame}}
+    if last_frame:
+        cond["last_frame"] = ["22", 0]
+        g["22"] = {"class_type": "LoadImage", "inputs": {"image": last_frame}}
+    g["7"] = {"class_type": "MiniMaxH3ImageToVideo", "inputs": cond}
+
+    g["8"] = {"class_type": "KSampler",
+              "inputs": {"seed": seed, "steps": steps, "cfg": 1.0,
+                         "sampler_name": sampler, "scheduler": scheduler, "denoise": 1.0,
+                         "model": ["5", 0], "positive": ["7", 0], "negative": ["7", 0],
+                         "latent_image": ["7", 1]}}
+    g["9"] = {"class_type": "VAEDecode", "inputs": {"samples": ["8", 0], "vae": ["3", 0]}}
+    g["11"] = {"class_type": "CreateVideo", "inputs": {"images": ["9", 0], "fps": float(FPS)}}
+
+    if audio:
+        g["4a"] = {"class_type": "VAELoader", "inputs": {"vae_name": AVAE}}
+        g["10"] = {"class_type": "VAEDecodeAudio",
+                   "inputs": {"samples": ["8", 0], "vae": ["4a", 0]}}
+        g["11"]["inputs"]["audio"] = ["10", 0]
+
+    g["12"] = {"class_type": "SaveVideo",
+               "inputs": {"video": ["11", 0], "filename_prefix": "h3",
+                          "format": "auto", "codec": codec}}
+    return g
+
+
+def resolve_name(hist_out):
+    """SaveVideo's history entry key varies by version - take any filename it reports."""
+    for key in ("videos", "images", "gifs", "animation"):
+        items = hist_out.get(key) or []
+        if items and isinstance(items, list):
+            f = items[0].get("filename")
+            if f:
+                return f
+    return None
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("prompt", nargs="?", default="")
+    ap.add_argument("--check", action="store_true", help="verify the weights are visible")
+    ap.add_argument("--w", type=int, default=864, help="864x480 is the measured working point")
+    ap.add_argument("--h", type=int, default=480)
+    grp = ap.add_mutually_exclusive_group()
+    grp.add_argument("--seconds", type=float, default=5.0)
+    grp.add_argument("--frames", type=int)
+    ap.add_argument("--steps", type=int, default=None, help="default: 4 with --turbo 4, else 8")
+    ap.add_argument("--turbo", choices=sorted(LORAS), default="8step")
+    ap.add_argument("--first-frame", help="image to animate (I2VA); copied into ComfyUI's input dir")
+    ap.add_argument("--last-frame", help="ending image (FL2VA); copied into ComfyUI's input dir. "
+                        "R9 verified 2026-10-27: MiniMaxH3ImageToVideo.optional=[first_frame,last_frame]")
+    ap.add_argument("--no-audio", action="store_true")
+    ap.add_argument("--shift-video", type=float, default=12.0)
+    ap.add_argument("--shift-audio", type=float, default=3.0)
+    ap.add_argument("--sampler", default="euler")
+    ap.add_argument("--scheduler", default="simple")
+    ap.add_argument("--codec", default="auto", help="SaveVideo codec; auto resolves to h264")
+    ap.add_argument("--seed", type=int, default=None)
+    ap.add_argument("--timeout", type=int, default=3600, help="seconds to wait for the render")
+    ap.add_argument("--queue-wait", type=int, default=7200,
+                    help="seconds to let another render finish before submitting this one")
+    a = ap.parse_args()
+
+    if a.check:
+        return check()
+    if not a.prompt:
+        ap.print_usage(sys.stderr); return 1
+
+    # geometry: the model only accepts multiples of 32, and the canvas it was
+    # trained on is a 768 short edge capped at 768*1344 pixels.
+    w, h = (round(a.w / CANVAS_MULTIPLE) * CANVAS_MULTIPLE,
+            round(a.h / CANVAS_MULTIPLE) * CANVAS_MULTIPLE)
+    if (w, h) != (a.w, a.h):
+        print(f"  canvas {a.w}x{a.h} snapped to {w}x{h} (multiples of {CANVAS_MULTIPLE})",
+              file=sys.stderr)
+
+    frames = a.frames if a.frames else int(round(a.seconds * FPS))
+    frames = snap_frames(max(5, frames))
+    steps = a.steps if a.steps else (4 if a.turbo == "4step" else 8)
+    seed = a.seed if a.seed is not None else int(time.time() * 1000) % 2**31
+
+    ff = None
+    if a.first_frame:
+        p = os.path.abspath(os.path.expanduser(a.first_frame))
+        if not os.path.exists(p):
+            print(f"  first frame not found: {p}", file=sys.stderr); return 1
+        ff = f"anim_{os.path.basename(p)}"
+        # LoadImage only sees ComfyUI's input dir, which is not volume-mounted.
+        subprocess.run(["podman", "cp", p, f"{CONTAINER}:/opt/ComfyUI/input/{ff}"],
+                       check=True, capture_output=True)
+
+    # FL2VA: the ending frame. R9 probe (object_info, 2026-10-27) verified
+    # MiniMaxH3ImageToVideo.optional = [first_frame, last_frame], both IMAGE.
+    lf = None
+    if a.last_frame:
+        p = os.path.abspath(os.path.expanduser(a.last_frame))
+        if not os.path.exists(p):
+            print(f"  last frame not found: {p}", file=sys.stderr); return 1
+        lf = f"anim_last_{os.path.basename(p)}"
+        subprocess.run(["podman", "cp", p, f"{CONTAINER}:/opt/ComfyUI/input/{lf}"],
+                       check=True, capture_output=True)
+
+    g = build(a.prompt, w, h, frames, steps, seed, a.turbo, first_frame=ff,
+              shift_video=a.shift_video, shift_audio=a.shift_audio,
+              audio=not a.no_audio, sampler=a.sampler, scheduler=a.scheduler,
+              codec=a.codec, last_frame=lf)
+
+    dur = frames / FPS
+    print(f"  {w}x{h}  {frames} frames ({dur:.2f}s @ {FPS} fps)  {steps} steps  "
+          f"turbo={a.turbo}  shift={a.shift_video}/{a.shift_audio}  "
+          f"audio={'off' if a.no_audio else 'on'}", file=sys.stderr, flush=True)
+
+    os.makedirs(OUT_DIR, exist_ok=True)
+
+    # Do not add work to a backed-up queue. --timeout is measured from the moment
+    # this process submits, so a job that waits behind another render can time out
+    # having never started - and the caller then submits another. Measured on
+    # 2026-10-26: 20 variants, every one "FAILED after 3601s" while its clip landed
+    # minutes later, because ComfyUI held 1 running + 1 pending the whole time.
+    waited = 0.0
+    while True:
+        try:
+            q = get("/queue")
+            ahead = len(q.get("queue_running") or []) + len(q.get("queue_pending") or [])
+        except Exception:
+            ahead = 0                      # a node that cannot answer is not a queue
+        if not ahead:
+            break
+        if waited > a.queue_wait:
+            print(f"  giving up after waiting {waited:.0f}s for {ahead} job(s) ahead",
+                  file=sys.stderr)
+            return 1
+        print(f"  ComfyUI has {ahead} job(s) ahead; waiting "
+              f"({waited:.0f}s of {a.queue_wait}s)", file=sys.stderr, flush=True)
+        time.sleep(15)
+        waited += 15
+
+    before = set(os.listdir(OUT_DIR))
+    t0 = time.time()
+    status, body = post("/prompt", {"prompt": g, "client_id": "video-sandbox"})
+    if status != 200:
+        print(f"  rejected by ComfyUI ({status}):", file=sys.stderr)
+        print("  " + body[:1500].replace("\n", "\n  "), file=sys.stderr)
+        return 1
+    pid = json.loads(body)["prompt_id"]
+
+    while time.time() - t0 < a.timeout:
+        hist = get_soft(f"/history/{pid}") or {}
+        if pid in hist:
+            st = hist[pid].get("status", {})
+            name = None
+            for nid, out in (hist[pid].get("outputs", {}) or {}).items():
+                name = resolve_name(out)
+                if name:
+                    break
+            if not name:
+                # Fall back to a directory diff: SaveVideo has written even when the
+                # history shape does not carry the filename in this version.
+                new = sorted(x for x in set(os.listdir(OUT_DIR)) - before if x.startswith("h3"))
+                name = new[-1] if new else None
+            if name:
+                el = st.get("execution_time", 0)
+                print(f"  rendered in {time.time()-t0:.1f}s (node reported {el:.1f}s)",
+                      file=sys.stderr)
+                print(os.path.join(OUT_DIR, name))
+                return 0
+            print(f"  finished with no file: {json.dumps(st)[:600]}", file=sys.stderr)
+            return 1
+        # 45 s, not 2: while it is sampling the node does not answer HTTP, so a tight
+        # poll only ever blocks on a timeout - and measured on H3, those stalled calls
+        # ran 18-43 s each. Nothing about a 35-minute job needs a faster answer.
+        time.sleep(45)
+    print(f"  timed out after {a.timeout}s - the job may still be running; the file will "
+          f"still appear in {OUT_DIR}", file=sys.stderr)
+    return 1
+
+
+sys.exit(main())
