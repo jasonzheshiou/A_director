@@ -33,14 +33,19 @@ for p in "${PATTERNS[@]}"; do
   grep -rnIE "$p" --exclude-dir=.git . 2>/dev/null | head -5 | sed 's/^/        /'
 done
 
-# Any media beyond the one approved sample?
-n=$(find . -path ./.git -prune -o -type f \( -name '*.mp4' -o -name '*.mov' -o -name '*.wav' -o -name '*.png' \) -print | wc -l)
-if (( n > 1 )); then
-  fail=1; echo "  HIT   more media than the single approved sample ($n files)"
-  find . -path ./.git -prune -o -type f \( -name '*.mp4' -o -name '*.mov' -o -name '*.wav' -o -name '*.png' \) -print | sed 's/^/        /'
+# Media policy: exactly one delivered clip; images only in assets/ (the inline README
+# preview); no audio at all, because a stray .wav here could be the voice reference.
+clips=$(find . -path ./.git -prune -o -type f \( -name '*.mp4' -o -name '*.mov' -o -name '*.mkv' \) -print)
+audio=$(find . -path ./.git -prune -o -type f \( -name '*.wav' -o -name '*.mp3' -o -name '*.m4a' -o -name '*.flac' -o -name '*.ogg' \) -print)
+loose=$(find . -path ./.git -prune -o -path ./assets -prune -o -type f \( -name '*.png' -o -name '*.jpg' -o -name '*.jpeg' -o -name '*.gif' -o -name '*.webp' \) -print)
+n=$(printf '%s\n' "$clips" | grep -c .)
+if (( n != 1 )); then
+  fail=1; echo "  HIT   expected exactly one sample clip, found $n"; printf '%s\n' "$clips" | sed 's/^/        /'
 else
-  echo "  ok    exactly one media sample ($n)"
+  echo "  ok    exactly one sample clip"
 fi
+[[ -n $audio ]] && { fail=1; echo "  HIT   no audio may be published (voice-clone rights)"; printf '%s\n' "$audio" | sed 's/^/        /'; } || echo "  ok    no audio files"
+[[ -n $loose ]] && { fail=1; echo "  HIT   image outside assets/"; printf '%s\n' "$loose" | sed 's/^/        /'; } || echo "  ok    images only in assets/"
 
 # Anything over GitHub's hard 100 MB block?
 big=$(find . -path ./.git -prune -o -type f -size +95M -print)

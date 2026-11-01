@@ -27,7 +27,11 @@ with **MiniMax H3** on a single AMD GPU that is *also* the machine's LLM server.
 
 ## ▶ The film
 
-**[`sample/imagine_2035_final_v27+brand-vo-v04en-e3.mp4`](sample/imagine_2035_final_v27+brand-vo-v04en-e3.mp4)** — the delivered cut, shipped here as the reference for what comes out the other end.
+![Six-second loop from the delivered cut: an actuary's desk, a holographic model assembling above his hands, narration carried as burned subtitles](assets/preview.gif)
+
+*That loop plays inline — 6 s of the film, silent.* The full cut, with narration, score
+and subtitles: **[`sample/imagine_2035_final_v27+brand-vo-v04en-e3.mp4`](sample/imagine_2035_final_v27+brand-vo-v04en-e3.mp4)**
+— the delivered film, shipped here as the reference for what comes out the other end.
 
 | | |
 |---|---|
@@ -40,10 +44,13 @@ with **MiniMax H3** on a single AMD GPU that is *also* the machine's LLM server.
 ≈1.6 Mbps is the burn recipe's `-b:v 1600k` showing up exactly, see
 [Combination](#5-combination--the-film-build-ladder).)*
 
-> **Want it to play inline at the top of this README instead of one click away?**
-> GitHub only hosts an inline player for media uploaded through its own editor. Drag this
-> file into the README editor once on github.com, and replace the link above with the
-> `user-attachments` URL it gives you. Nothing else changes.
+> **Why a GIF instead of the film itself?** GitHub will not play a video that is committed
+> to a repository: `<video>` is stripped from markdown, and a committed `.mp4` only plays
+> one click away on its own file page. A GIF is the only thing that animates inline from a
+> plain `git push`, so the loop leads and the audio stays one click away. If you want the
+> **full cut with sound inline**, drag `sample/imagine_2035_final_v27+brand-vo-v04en-e3.mp4`
+> into the README editor on github.com once and replace the GIF line above with the
+> `user-attachments` URL it returns — nothing else needs to change.
 
 ### Licence
 
@@ -475,6 +482,7 @@ A_director/
   code/vgen             run lifecycle: render, batch, collect, heal, recover
   code/animate          single H3 clip render against local ComfyUI
   sample/               the one delivered clip, as a reference
+  assets/preview.gif    the 6 s silent loop shown inline above
   tools/publish-check.sh  leak gate run before every push
 ```
 
