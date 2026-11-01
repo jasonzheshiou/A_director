@@ -187,14 +187,10 @@ Full screen once, then **on a phone**. The phone pass tends to find every subtit
 small and every line that's too quiet. And on a burn, it's worth pulling out a couple of
 frames and looking at them instead of trusting a "success" message.
 
-### Naming and expectations
+### Naming
 
 * **I don't overwrite.** `v2`, `v3`, `v4` alongside `v1` — the favourite is often the third
   one, and there's no way to know which in advance.
-* **An evening is a reasonable budget.** Roughly six short takes per hour of machine time, so
-  a 90-second film is usually an afternoon of choosing plus a night of rendering.
-* **Say the turn out loud before publishing.** If a stranger wouldn't get it in ten seconds,
-  cutting the film shorter usually helps more than explaining it longer.
 
 ---
 
