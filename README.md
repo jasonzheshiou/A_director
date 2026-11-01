@@ -3,11 +3,243 @@
 Architecture notes and the core code for a two-box setup that renders short films
 with **MiniMax H3** on a single AMD GPU that is *also* the machine's LLM server.
 
-There is no orchestration framework here. The interesting part is the handover:
-how one GPU is rented from an LLM, used for a 36-minute render, and given back
-with proof that the box is in the state you claim it is.
+---
+
+## ▶ The film
+
+**[`sample/imagine_2035_final_v27+brand-vo-v04en-e3.mp4`](sample/imagine_2035_final_v27+brand-vo-v04en-e3.mp4)** — the delivered cut, shipped here as the reference for what comes out the other end.
+
+| | |
+|---|---|
+| duration | **99.96 s** (1:40) |
+| container / codecs | MP4, **H.264** (`avc1`) + **AAC** (`mp4a`) |
+| size / bitrate | 19.4 MB, ≈1.6 Mbps |
+| what it is | animated shots + cloned-voice narration + generated score + burned subtitles, all from this pipeline |
+
+*(Container facts parsed directly from `moov`/`mvhd` — no media tooling needed. The
+≈1.6 Mbps is the burn recipe's `-b:v 1600k` showing up exactly, see
+[Combination](#5-combination--the-film-build-ladder).)*
+
+> **Want it to play inline at the top of this README instead of one click away?**
+> GitHub only hosts an inline player for media uploaded through its own editor. Drag this
+> file into the README editor once on github.com, and replace the link above with the
+> `user-attachments` URL it gives you. Nothing else changes.
+
+### Licence
+
+**The code and documents here are MIT** — see [LICENSE](LICENSE).
+
+**The sample film is not MIT.** Its score was generated with `m-a-p/YuE2-3B`
+(**CC-BY-NC-4.0**) and its narration is a voice clone rendered with Qwen3-TTS, so the
+clip is published as a **non-commercial technical sample**. Clear both licences before
+any commercial use of anything derived from it. MIT here covers `code/`, `tools/` and
+this README — it cannot grant rights the pipeline never owned.
 
 ---
+
+# Part I — Directing with it
+
+What you actually do, stage by stage. Three things are true of every stage and they
+explain the shape of all the commands:
+
+* **every stage is a one-shot process that exits.** Nothing resident — the host's swap
+  gate refuses to start a tenant while anything extra holds memory, so a leftover process
+  is not untidy, it blocks the next render.
+* **the handover is the expensive operation**, not the prompt. Batching exists to pay it
+  once.
+* **nothing is judged by an exit code.** Each stage's output is checked as an artefact.
+
+```
+shot list → keyframes → shots → narration → score → subtitles → mux → burn → deliver
+   ①          ②          ③         ④           ⑤         ⑥         ⑦      ⑧       ⑨
+```
+
+## 1. Video creation
+
+Two entry points, and the difference is the handover.
+
+```bash
+# one shot, full cycle: LLM down → H3 up → render → clip archived → LLM back up
+vgen render "<shot description>" --seconds 5 --w 864 --h 480 --name s07-desk
+
+# N shots, ONE handover. "description<TAB>extra args" per line.
+vgen batch --file shots.txt
+
+# a named shot list that lives on the host, stitched afterwards
+vgen film --film <film-name>
+
+# plan without touching the GPU
+vgen render "…" --seconds 5 --dry-run
+```
+
+`--keep-llm-down` chains several batches while the LLM stays off, paying the handover
+once for the whole session instead of once per batch.
+
+**The take length is a budget decision, not a taste one.** Sampling cost is ~quadratic
+up to 124 frames and then collapses (exponent ≈3.37 above it):
+
+| frames | video | wall time | you should read that as |
+|---|---|---|---|
+| 56 | 2.3 s | 4 m 03 s | a plumbing test |
+| 124 | 5.2 s | **10 m 30 s** | **the unit of exploration** |
+| 243 | 10.1 s | **36 m 17 s** | a promoted shot only |
+
+So: explore at 5 s, promote to 10 s. A 10-second take costs 3.5× a 5-second one, not 2×.
+
+**Character consistency across shots** is carried by pixels, not by repeating a
+description. A chained shot starts from the previous shot's **last frame**; a new shot
+renders from text. For a hero shot you can seed it explicitly:
+
+```bash
+animate --first-frame <keyframe.png> "<motion for this shot>"
+```
+
+Keyframes come from the image stage (`qimg`, Qwen-Image-2.1-Turbo, **34 s per
+1152×640**), which — unlike H3 — runs **alongside** the resident LLM. Generating a
+hundred keyframes therefore costs no handovers at all, which is why storyboarding is
+cheap and re-rendering is not.
+
+## 2. Narrative creation
+
+The audio bench is `sound`, eight one-shot subcommands, each in its own container:
+
+```bash
+sound status / doctor                     # what is hosted; ROCm + ffmpeg + imports
+sound say  "<line>" --ref <your-reference.wav> --name take07   # narration in a cloned voice
+sound cv   "<line>" --voice <preset>       # preset voices, with style/emotion instruct
+sound design "<line>" --describe "…"       # a voice built from a text description
+sound split <clip.mp4>                     # demucs stem separation of a clip's baked track
+sound bed …                                # ambience beds
+sound lay …                                # voice + beds + kept clip audio + ducked music
+```
+
+`sound say` is the spine: one line of narration per take, in a voice cloned from a
+reference clip you supply. Measured on this box: model load **2.5 s**, and **10.00 s of
+speech rendered in 18 s total while the LLM stayed resident** — narration never needs the
+GPU handed over, so you can voice a whole script between two renders.
+
+**Order matters: voice first, then cut.** Take durations are the thing picture gets cut
+to, so voicing happens before the edit is locked — re-voicing after locking means
+re-cutting picture, and re-cutting picture means re-timing every subtitle cue later.
+Bake nothing until the read is final.
+
+One trap worth naming: each H3 clip arrives with **one baked audio track**, and each
+clip's ambience is independently invented by the model. You cannot inherit a coherent
+soundtrack from the shots, which is why the soundtrack is *built* (`sound lay`) rather
+than collected. `sound split` exists for the parts of the baked track you do want —
+`sound lay` measured **−14.0 LUFS / −1.0 dBTP** on delivery.
+
+## 3. Music creation
+
+The score is generated, and the queue is data:
+
+```bash
+bin/music-batch [spec-file]      # default: out/styles/specs.txt
+```
+
+A spec file is one cue per line — `<variation>:<style-file>:<seed>[:<output-dir>]`
+(see `bin/music-specs` for a 30-cue example). A cue counts as **done** only when
+`<output>/listen/listening.mp3` exists, so the driver is re-runnable: kill it, re-run
+it, and it finishes what is missing without repeating what landed. That property is what
+makes a 30-cue hunt on a shared GPU tolerable.
+
+Two constraints the driver encodes, both measured:
+
+* **one GPU job at a time.** YuE2 peaks at **11.18 GiB** while the resident LLM leaves
+  ~**18.21 GiB** free — it fits, but only alongside the LLM and only one at a time.
+* **the image's torch, not PyPI's.** PyPI's recipe-pinned `torch 2.10.0+rocm7.1`
+  segfaults on gfx1151 at the first device allocation; the driver runs the image's
+  `2.14.0a0+rocm7.15` with `yue2` from a `--no-deps` install so nothing shadows it.
+
+Style is a text file per variation, seed is an integer, and re-tuning a finished mix is
+deliberately one number in one script (see the gain dial in
+[Combination](#5-combination--the-film-build-ladder)).
+
+## 4. Subtitle creation
+
+**Cue times are measured, never assumed.** You do not hand-time subtitles and you do not
+trust the script's line lengths — you detect where the rendered speech actually is:
+
+```bash
+ffmpeg -i take07.wav -af silencedetect=noise=-40dB:d=0.12 -f null -
+# cue = slot start + first speech onset … last voiced segment end
+```
+
+One cue per line for an English set; for CJK, split at phrase boundaries (22 cues for
+the Chinese ladder). Font for burns: `NotoSansCJKsc-Regular.otf`.
+
+Then there are two kinds of subtitle, and they belong to different stages of the build:
+
+| | mechanism | when |
+|---|---|---|
+| **soft** | a `mov_text` track added to the muxed file | whenever — costs nothing, picture untouched |
+| **burned** | `-vf "subtitles=…:force_style=…,drawtext=…"` in the same pass as the audio mux | **only after the audio is final** |
+
+Burning is a full re-encode of the picture, so burning early means burning again for
+every audio revision you touch afterwards. That single ordering rule is most of the
+delivery cost.
+
+And a burn is verified by **looking**, not by a clean exit: extract a frame with a
+subtitle active, one without, and one during any watermark beat. A filter string that
+silently no-ops produces a perfect-looking encode of the wrong picture.
+
+## 5. Combination — the film-build ladder
+
+The final assembly is a ladder of builds over **one picture carrier**, and the order of
+operations is the whole design. Two build orders, both starting from the same video:
+
+**soft build** — no re-encode at all:
+
+```
+-map 0:v:0 -i mix.mp3 -map 1:a:0  -c:v copy -c:a copy        then add mov_text subs
+```
+
+Picture stays byte-identical, and that claim is *audited*, not assumed: the H.264
+elementary-stream md5 of the carrier must not move across audio revisions. If the hash
+moved, something re-encoded the picture and the ladder is broken.
+
+**burned build** — one pass, because the subtitle burn and the audio mux share it:
+
+```
+-vf "subtitles=…:force_style=…,drawtext=…"
+-c:v libopenh264 -b:v 1600k -profile:v high -pix_fmt yuv420p     # no libx264 in the container ffmpeg
+-movflags +faststart
+```
+
+The audio that gets muxed in is itself a chain, and its order is load-bearing:
+
+```
+voice   : highpass=f=90 → acompressor=-18dB:3:8:120
+music   : cue taken from its own 63 s mark → volume=<dial> → afade out
+ambience: native clip track at volume 0.12
+mix     : amix normalize=0 → alimiter limit=0.95 → loudnorm I=-14:TP=-1.0:LRA=11
+          → libmp3lame 192k 48k
+```
+
+`amix normalize=0` matters — with normalisation on, the mix silently re-balances itself
+whenever you add a stem, and the loudness you approved is gone. The music level sits
+behind **one dial** (currently `0.25`; it has been `0.50` and `0.35`) in a rebuild script
+that stays on the host, because re-tuning a mix must be cheap enough that you actually
+re-tune it.
+
+**Nothing superseded is ever overwritten.** Previous encodes become `*.vN.mp4` in an
+archive directory, previous mixes likewise, and the record points at the live file while
+listing the archived ones with their md5s. Everything that ships is md5-verified after
+transfer. The English line of the sample above is
+`e3 → v1 → v2 → v3 → v4` — four builds of a delivery, none of them a rewrite.
+
+## Ordering rules that save days
+
+1. **Storyboard at 5 s, promote at 10 s** — the cost curve is not linear.
+2. **Keyframes before shots** — the image stage coexists with the LLM, so it is free of handovers.
+3. **Voice before picture lock** — take durations drive the cut.
+4. **Audio final before any burn** — a burn is a re-encode of the whole picture.
+5. **Soft first, burned last** — cheap ladder rungs first, expensive one last.
+6. **Verify with artefacts and hashes**, at every rung: the clip, the md5, the extracted frame.
+
+---
+
+# Part II — How it works
 
 ## The constraint that shapes everything
 
@@ -38,8 +270,6 @@ Two consequences that drive the whole design:
 * a render is a *state transition*, not a command — it can be interrupted at any arrow
 * the box is shared with the user's own work, so an interrupted handover is a bug report,
   not an inconvenience
-
----
 
 ## Model swapping — `code/host-reset.sh`
 
@@ -97,8 +327,6 @@ An abliterated box must never come back serving the stock checkpoint, silently.
 Nothing here auto-starts an LLM — no unit, no cron, no boot hook. That is a deliberate
 invariant, because the box is shared with interactive work.
 
----
-
 ## Run lifecycle — `code/vgen`
 
 Runs on the workstation, drives the host over ssh. Owns the whole cycle above.
@@ -139,8 +367,6 @@ not a replay of a half-run sequence.
 A related consequence: the workstation has no `ffmpeg`/`ffprobe`. Media is probed where
 the tools live, and only verdicts cross the wire.
 
----
-
 ## The render node — `code/animate`
 
 Renders one H3 clip (video **and** stereo audio) against the local ComfyUI
@@ -167,8 +393,6 @@ Notes that matter to anyone touching the graph:
 * `SaveVideo` needs `codec` as well as `format` on ComfyUI 0.31; omitting it executes every
   other node and then fails at the write.
 
----
-
 ## Measured cost (864×480, `--turbo 4step`, first-frame, with audio)
 
 | frames | seconds of video | wall | sampling | non-sampler |
@@ -187,8 +411,6 @@ renders (one job already holds ~54–64 GiB of GTT), INT8 attention on the `hip`
 (no attention capability there), and `HIP_FORCE_DEV_KERNARG` + `expandable_segments`
 (null on H3, −33% elsewhere).
 
----
-
 ## The dashboard
 
 `vgen dash` for the terminal; a small Python server for the browser. Two design points
@@ -200,46 +422,23 @@ worth keeping:
 * it binds to a VPN-only address by default and **refuses `0.0.0.0`** — the page shows
   model paths, run state and a button that starts a process
 
----
-
-## The example
-
-`sample/imagine_2035_final_v27+brand-vo-v04en-e3.mp4` — the delivered cut this pipeline
-produced, shipped here as a concrete reference for what comes out the other end.
-
-| | |
-|---|---|
-| duration | **99.96 s** |
-| container / codecs | MP4, **H.264** (`avc1`) + **AAC** (`mp4a`) |
-| size / bitrate | 19.4 MB, ≈1.6 Mbps |
-
-*(Container facts parsed directly from `moov`/`mvhd` — no other tooling needed.)*
-
-It is the end of this chain, each stage a separate one-shot process that exits and leaves
-nothing resident:
-
-```
-shot list → keyframes (image stage) → H3 clips (video tenant) → narration → score → mux
-```
-
-**Rights on the sample:** the score is generated with `m-a-p/YuE2-3B`
-(**CC-BY-NC-4.0**) and the narration is a voice clone rendered with Qwen3-TTS.
-It is published here as a **non-commercial** technical sample; clear both licences before
-any commercial use.
-
----
-
 ## Layout
 
 ```
 A_director/
   README.md
+  LICENSE               MIT — code and docs only, see the note above
   code/host-reset.sh    host-side tenant swap + proof gate
   code/vgen             run lifecycle: render, batch, collect, heal, recover
   code/animate          single H3 clip render against local ComfyUI
   sample/               the one delivered clip, as a reference
   tools/publish-check.sh  leak gate run before every push
 ```
+
+**Documented but not shipped here:** the image stage (`qimg`), the audio bench (`sound`)
+and the music driver (`music-batch` / `music-specs`) are described by their interfaces in
+[Part I](#part-i--directing-with-it) — they are host-side one-shot containers and this
+repository carries only the three scripts that own the GPU handover.
 
 ### Reuse
 
@@ -258,8 +457,6 @@ GPU of the same class:
 Addresses in `code/` are placeholders from RFC 5737 documentation space, and the ssh
 alias is neutralised; container and unit names are the real ones.
 
----
-
 ## The short version
 
 1. **One tenant at a time, and prove the handover with measurements** — `gtt` and
@@ -267,3 +464,4 @@ alias is neutralised; container and unit names are the real ones.
 2. **Completion is an artefact.** The clip appearing in `out/`, not a log line.
 3. **Every state must be finishable by someone.** Write what you owe before you take the
    GPU, so recovery is an idempotent converge rather than a replay.
+4. **Order the ladder by cost.** Voice before cut, audio before burn, soft before burned.
